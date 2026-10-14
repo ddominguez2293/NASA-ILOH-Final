@@ -1,0 +1,169 @@
+---
+title: "PET"
+author: "Daniel Dominguez"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths, packages, and helper functions
+source("SRC/Functions_Paths.R")
+```
+
+```{r}
+catchments <- st_read(catchment_path, quiet = TRUE) %>%
+  mutate(comid = as.character(comid))
+
+catchments_centroid <- st_centroid(catchments)
+
+catchment_lat <- catchments_centroid %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  rename(lon = X, lat = Y) %>%
+  mutate(comid = catchments$comid) %>%
+  select(comid, lon, lat)
+
+# Keep this small lookup table in memory.
+head(catchment_lat)
+```
+
+```{r}
+drivers_in_file <- file.path(daily_drivers_dir, "drivers_daily_joined.parquet")
+drivers_pet_out_file <- file.path(daily_drivers_dir, "drivers_daily.parquet")
+
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+
+# Give DuckDB access to the small latitude lookup table.
+dbWriteTable(con, "catchment_lat", catchment_lat, overwrite = TRUE)
+
+# Join and compute PET inside DuckDB instead of R memory.
+dbExecute(con, paste0("
+COPY (
+  SELECT
+    d.*,
+    cl.lon,
+    cl.lat,
+
+    -- Day of year
+    CAST(strftime(d.date, '%j') AS INTEGER) AS DOY,
+
+    -- Extraterrestrial radiation, Ra, in mm/day
+    (
+      (
+        (24 * 60 / pi()) * 0.0820 *
+        (1 + 0.033 * cos(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER))) *
+        (
+          acos(
+            -tan(cl.lat * pi() / 180) *
+            tan(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+          ) *
+          sin(cl.lat * pi() / 180) *
+          sin(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+          +
+          cos(cl.lat * pi() / 180) *
+          cos(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39)) *
+          sin(
+            acos(
+              -tan(cl.lat * pi() / 180) *
+              tan(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+            )
+          )
+        )
+      ) * 0.408
+    ) AS Ra,
+
+    -- Catchment-scale Hargreaves PET
+    0.0023 * (d.tmean_c + 17.8) *
+      sqrt(greatest(d.tmax_c - d.tmin_c, 0)) *
+      (
+        (
+          (24 * 60 / pi()) * 0.0820 *
+          (1 + 0.033 * cos(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER))) *
+          (
+            acos(
+              -tan(cl.lat * pi() / 180) *
+              tan(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+            ) *
+            sin(cl.lat * pi() / 180) *
+            sin(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+            +
+            cos(cl.lat * pi() / 180) *
+            cos(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39)) *
+            sin(
+              acos(
+                -tan(cl.lat * pi() / 180) *
+                tan(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+              )
+            )
+          )
+        ) * 0.408
+      ) AS PET,
+
+    -- Basin-scale Hargreaves PET
+    0.0023 * (d.bsn_tmean_c + 17.8) *
+      sqrt(greatest(d.bsn_tmax_c - d.bsn_tmin_c, 0)) *
+      (
+        (
+          (24 * 60 / pi()) * 0.0820 *
+          (1 + 0.033 * cos(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER))) *
+          (
+            acos(
+              -tan(cl.lat * pi() / 180) *
+              tan(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+            ) *
+            sin(cl.lat * pi() / 180) *
+            sin(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+            +
+            cos(cl.lat * pi() / 180) *
+            cos(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39)) *
+            sin(
+              acos(
+                -tan(cl.lat * pi() / 180) *
+                tan(0.409 * sin(2 * pi() / 365 * CAST(strftime(d.date, '%j') AS INTEGER) - 1.39))
+              )
+            )
+          )
+        ) * 0.408
+      ) AS bsn_PET,
+
+    sin(2 * pi() * CAST(strftime(d.date, '%j') AS INTEGER) / 365) AS DOY_sin,
+    cos(2 * pi() * CAST(strftime(d.date, '%j') AS INTEGER) / 365) AS DOY_cos
+
+  FROM read_parquet('", drivers_in_file, "') d
+  LEFT JOIN catchment_lat cl
+  ON CAST(d.comid AS VARCHAR) = CAST(cl.comid AS VARCHAR)
+)
+TO '", drivers_pet_out_file, "'
+(FORMAT PARQUET);
+"))
+
+dbDisconnect(con, shutdown = TRUE)
+
+cat("Saved PET-enhanced daily drivers to:", drivers_pet_out_file, "\n")
+```
+
+```{r}
+# Sanity check to make sure calculations were made 
+
+drivers_pet <- arrow::read_parquet(file.path(daily_drivers_dir, "drivers_daily.parquet"))
+
+drivers_pet %>%
+  summarise(
+    n_rows = n(),
+    n_comids = n_distinct(comid),
+    pct_Ra = mean(!is.na(Ra)),
+    pct_PET = mean(!is.na(PET)),
+    pct_bsn_tmean_c = mean(!is.na(bsn_tmean_c)),
+    pct_bsn_PET = mean(!is.na(bsn_PET)),
+    pct_bsn_temp_and_Ra = mean(
+      !is.na(bsn_tmax_c) &
+      !is.na(bsn_tmin_c) &
+      !is.na(bsn_tmean_c) &
+      !is.na(Ra)
+    )
+  )
+```
+

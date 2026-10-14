@@ -48,3 +48,23 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+
+# R project file
+*.Rproj
+
+# Data folder (large, not tracked)
+/data
+
+# Ignore csv files
+*.csv
+
+*.RData
+*.RDataTmp1
+*.RDataTmp2
+
+# Figures
+*.png
+
+# macOS
+.DS_Store

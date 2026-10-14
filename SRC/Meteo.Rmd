@@ -1,0 +1,629 @@
+---
+title: "Meteo"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths + helper functions
+source("SRC/Functions_Paths.R")
+
+# Packages specific to meteorological extraction
+library(climateR)
+library(terra)
+library(exactextractr)
+library(DBI)
+library(duckdb)
+library(data.table)
+```
+
+```{r}
+# read in catchments and basins
+catchments <- st_read(catchment_path, quiet = TRUE)
+
+basins <- st_read(basins_path, quiet = TRUE) %>%
+  #mutate(comid = as.character(comid)) %>%
+  st_make_valid() %>%
+  st_transform(4326)
+
+```
+
+```{r}
+# set time window of interest
+start_date <- "1984-01-01" #1984-01-01
+end_date   <- "2026-04-01"   # adjust as needed
+
+#set parameters to retrieve
+vars <- c("pr",      # precipitation
+        "tmmx",    # max temp
+          "tmmn",    # min temp
+          "srad",    # solar radiation
+          "vs",      # wind speed
+          "vpd",     # vapor pressure deficit
+          "sph",       # specific humidity (can be used for RH)
+          "rmin",    # min relative humidity (%)
+          "rmax")     # max relative humidity (%))
+
+meteo_catch_dir <- file.path(meteo_dir, "catchments")
+meteo_basin_dir <- file.path(meteo_dir, "basins")
+
+dir.create(meteo_catch_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(meteo_basin_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+
+
+
+```{r extract-catchment-vars}
+for (v in vars) {
+  
+  cat("\nExtracting catchment variable:", v, "\n")
+  
+  out_file <- file.path(
+    meteo_catch_dir,
+    paste0(v, "_daily.parquet")
+  )
+  
+  # Restart-safe: skip if already written
+  if (file.exists(out_file)) {
+    cat("Already exists, skipping:", out_file, "\n")
+    next
+  }
+  
+  # Give extract_variable a variable-specific folder too,
+  # in case the helper writes intermediate files internally.
+  tmp_out_dir <- file.path(meteo_catch_dir, paste0("tmp_", v))
+  dir.create(tmp_out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  dat <- extract_variable(
+    varname    = v,
+    polygons   = catchments,
+    start_date = start_date,
+    end_date   = end_date,
+    out_dir    = tmp_out_dir,
+    id_col     = "comid"
+  )
+  
+  dat <- dat %>%
+    mutate(
+      comid = as.character(comid),
+      date  = as.Date(date)
+    ) %>%
+    select(comid, date, all_of(v))
+  
+  arrow::write_parquet(dat, out_file)
+  
+  cat("Saved:", out_file, "\n")
+  
+  rm(dat)
+  gc()
+}
+
+```
+
+```{r extract-basin-vars}
+# This is working but it is taking too long to do this for now. 
+
+# for (v in vars) {
+#   
+#   cat("\nExtracting basin variable:", v, "\n")
+#   
+#   out_file <- file.path(
+#     meteo_basin_dir,
+#     paste0("bsn_", v, "_daily.parquet")
+#   )
+#   
+#   # Restart-safe: skip if already written
+#   if (file.exists(out_file)) {
+#     cat("Already exists, skipping:", out_file, "\n")
+#     next
+#   }
+#   
+#   # Variable-specific folder prevents internal overwrites
+#   tmp_out_dir <- file.path(meteo_basin_dir, paste0("tmp_", v))
+#   dir.create(tmp_out_dir, recursive = TRUE, showWarnings = FALSE)
+#   
+#   dat <- extract_variable(
+#   varname    = v,
+#   polygons   = basins,
+#   start_date = start_date,
+#   end_date   = end_date,
+#   out_dir    = tmp_out_dir,
+#   id_col     = "comid"
+# )
+# 
+# # Prefix basin variable name
+# dat <- dat %>%
+#   mutate(
+#     comid = as.character(comid),
+#     date  = as.Date(date)
+#   ) %>%
+#   rename(!!paste0("bsn_", v) := all_of(v)) %>%
+#   select(comid, date, all_of(paste0("bsn_", v)))
+#   
+#   arrow::write_parquet(dat, out_file)
+#   
+#   cat("Saved:", out_file, "\n")
+#   
+#   rm(dat)
+#   gc()
+# }
+```
+
+```{r compute-basin-meteo-from-catchment-meteo, message=TRUE, warning=TRUE}
+# ----------------------------
+# Compute basin-scale meteo from catchment-scale meteo
+#
+# Instead of raster-extracting over 40k overlapping upstream basin polygons,
+# this computes each basin-scale driver as the area-weighted mean of the
+# upstream catchment-scale drivers.
+#
+# Mathematical form:
+#   bsn_var[target_comid, date] =
+#     sum(var[upstream_comid, date] * area_m2[upstream_comid]) /
+#     sum(area_m2[upstream_comid])
+#
+# Inputs:
+#   data/nhdplus/flowlines.gpkg
+#   data/nhdplus/catchments.gpkg
+#   data/meteo/*_daily.parquet
+#
+# Outputs:
+#   data/daily_drivers/basin_members.parquet
+#   data/meteo/basins/bsn_*_daily.parquet
+# ----------------------------
+
+vars <- c("pr", "srad", "vs", "vpd", "sph", "rmin", "rmax", "tmmx", "tmmn")
+
+basin_members_path <- file.path(daily_drivers_dir, "basin_members.parquet")
+meteo_basin_dir <- file.path(meteo_dir, "basins")
+
+dir.create(meteo_basin_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Set TRUE if you want to rebuild the upstream membership table.
+# Set FALSE later if basin_members.parquet already exists and you only want to recompute basin meteo.
+rebuild_basin_members <- FALSE
+
+# Set TRUE to overwrite existing bsn_* files.
+overwrite_basin_meteo <- FALSE
+
+# ----------------------------
+# 1) Build upstream membership table
+#
+# Output structure:
+#   target_comid | upstream_comid | area_m2
+# ----------------------------
+
+if (rebuild_basin_members || !file.exists(basin_members_path)) {
+
+  cat("\nBuilding upstream membership table...\n")
+
+  flowlines <- st_read(flowlines_path, quiet = TRUE) %>%
+    st_drop_geometry() %>%
+    transmute(
+      comid = as.character(comid),
+      fromnode = as.character(fromnode),
+      tonode = as.character(tonode)
+    ) %>%
+    filter(!is.na(comid), !is.na(fromnode), !is.na(tonode))
+
+  catchment_area <- st_read(catchment_path, quiet = TRUE) %>%
+    st_drop_geometry() %>%
+    transmute(
+      upstream_comid = as.character(comid),
+      area_m2 = as.numeric(areasqkm) * 1e6
+    ) %>%
+    filter(!is.na(upstream_comid), !is.na(area_m2))
+
+  target_comids <- catchment_area %>%
+    transmute(target_comid = upstream_comid) %>%
+    distinct()
+
+  cat("Flowline COMIDs:", n_distinct(flowlines$comid), "\n")
+  cat("Catchment COMIDs:", n_distinct(catchment_area$upstream_comid), "\n")
+  cat("Target COMIDs:", nrow(target_comids), "\n")
+
+  # Routing lookup:
+  # upstream reach tonode == downstream reach fromnode
+  flow_dt <- as.data.table(flowlines)
+
+  reach_nodes <- flow_dt[, .(comid, fromnode, tonode)]
+
+  upstream_by_node <- split(reach_nodes$comid, reach_nodes$tonode)
+  fromnode_by_comid <- setNames(reach_nodes$fromnode, reach_nodes$comid)
+
+  get_upstream_comids <- function(target_comid) {
+    target_comid <- as.character(target_comid)
+
+    if (!target_comid %in% names(fromnode_by_comid)) {
+      return(character(0))
+    }
+
+    visited <- character(0)
+    queue <- target_comid
+
+    while (length(queue) > 0) {
+      current <- queue[1]
+      queue <- queue[-1]
+
+      if (current %in% visited) next
+
+      visited <- c(visited, current)
+
+      current_fromnode <- fromnode_by_comid[[current]]
+      ups <- upstream_by_node[[current_fromnode]]
+
+      if (!is.null(ups)) {
+        ups <- as.character(ups)
+        ups <- setdiff(ups, visited)
+        queue <- unique(c(queue, ups))
+      }
+    }
+
+    visited
+  }
+
+  member_list <- vector("list", nrow(target_comids))
+
+  for (i in seq_len(nrow(target_comids))) {
+    cid <- target_comids$target_comid[i]
+
+    if (i %% 100 == 0 || i == 1 || i == nrow(target_comids)) {
+      message("Building upstream membership ", i, " of ", nrow(target_comids), ": ", cid)
+    }
+
+    ups <- get_upstream_comids(cid)
+
+    if (!length(ups)) {
+      member_list[[i]] <- NULL
+      next
+    }
+
+    member_list[[i]] <- data.frame(
+      target_comid = cid,
+      upstream_comid = ups,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  basin_members <- bind_rows(member_list) %>%
+    left_join(catchment_area, by = "upstream_comid") %>%
+    filter(!is.na(area_m2)) %>%
+    mutate(
+      target_comid = as.character(target_comid),
+      upstream_comid = as.character(upstream_comid),
+      area_m2 = as.numeric(area_m2)
+    )
+
+  write_parquet(basin_members, basin_members_path)
+
+  cat("\nWrote basin membership table to:", basin_members_path, "\n")
+  cat("Rows:", nrow(basin_members), "\n")
+  cat("Target COMIDs:", n_distinct(basin_members$target_comid), "\n")
+  cat("Upstream COMIDs:", n_distinct(basin_members$upstream_comid), "\n")
+
+  basin_members %>%
+    group_by(target_comid) %>%
+    summarise(
+      n_upstream = n(),
+      total_area_m2 = sum(area_m2, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    summarise(
+      n_targets = n(),
+      min_upstream = min(n_upstream),
+      median_upstream = median(n_upstream),
+      max_upstream = max(n_upstream),
+      min_area_m2 = min(total_area_m2),
+      max_area_m2 = max(total_area_m2)
+    ) %>%
+    print()
+
+  rm(flowlines, catchment_area, target_comids, flow_dt, reach_nodes, member_list, basin_members)
+  gc()
+
+} else {
+  cat("\nUsing existing basin membership table:", basin_members_path, "\n")
+}
+
+# ----------------------------
+# 2) Compute basin-scale meteo from catchment-scale meteo
+#
+# For each variable:
+#   read catchment meteo file
+#   join to basin_members by upstream_comid
+#   area-weight to target_comid/date
+#   write bsn_* parquet
+# ----------------------------
+
+cat("\nComputing basin-scale meteo from catchment-scale meteo...\n")
+
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+
+dbExecute(con, "PRAGMA threads=8")
+dbExecute(con, "PRAGMA memory_limit='20GB'")
+
+for (v in vars) {
+
+  cat("\nComputing basin variable:", v, "\n")
+
+  in_file <- file.path(meteo_dir, paste0("/catchments/",v, "_daily.parquet"))
+  out_file <- file.path(meteo_basin_dir, paste0("bsn_", v, "_daily.parquet"))
+
+  if (!file.exists(in_file)) {
+    stop("Missing catchment meteo file: ", in_file)
+  }
+
+  if (file.exists(out_file) && !overwrite_basin_meteo) {
+    cat("Already exists, skipping:", out_file, "\n")
+    next
+  }
+
+  if (file.exists(out_file) && overwrite_basin_meteo) {
+    file.remove(out_file)
+  }
+
+  sql <- paste0("
+    COPY (
+      SELECT
+        m.target_comid AS comid,
+        d.date,
+        SUM(d.", v, " * m.area_m2) / SUM(m.area_m2) AS bsn_", v, "
+      FROM read_parquet('", basin_members_path, "') m
+      INNER JOIN read_parquet('", in_file, "') d
+        ON CAST(m.upstream_comid AS VARCHAR) = CAST(d.comid AS VARCHAR)
+      WHERE d.", v, " IS NOT NULL
+        AND m.area_m2 IS NOT NULL
+      GROUP BY
+        m.target_comid,
+        d.date
+    )
+    TO '", out_file, "'
+    (FORMAT PARQUET, COMPRESSION ZSTD);
+  ")
+
+  dbExecute(con, sql)
+
+  check <- dbGetQuery(con, paste0("
+    SELECT
+      COUNT(*) AS n_rows,
+      COUNT(DISTINCT comid) AS n_comids,
+      MIN(date) AS min_date,
+      MAX(date) AS max_date,
+     AVG(CASE WHEN bsn_", v, " IS NOT NULL THEN 1.0 ELSE 0.0 END) AS pct_value
+    FROM read_parquet('", out_file, "')
+  "))
+
+  print(check)
+}
+
+dbDisconnect(con, shutdown = TRUE)
+
+cat("\nFinished computing basin-scale meteo files.\n")
+
+# ----------------------------
+# 3) Final validation
+# ----------------------------
+
+cat("\nValidating key basin meteo files...\n")
+
+bsn_pr_path <- file.path(meteo_basin_dir, "bsn_pr_daily.parquet")
+bsn_tmmx_path <- file.path(meteo_basin_dir, "bsn_tmmx_daily.parquet")
+bsn_tmmn_path <- file.path(meteo_basin_dir, "bsn_tmmn_daily.parquet")
+
+bsn_pr <- read_parquet(bsn_pr_path)
+bsn_tmmx <- read_parquet(bsn_tmmx_path)
+bsn_tmmn <- read_parquet(bsn_tmmn_path)
+
+bsn_pr %>%
+  summarise(
+    variable = "bsn_pr",
+    n_rows = n(),
+    n_comids = n_distinct(comid),
+    min_date = min(date),
+    max_date = max(date),
+    pct_value = mean(!is.na(bsn_pr))
+  ) %>%
+  print()
+
+bsn_tmmx %>%
+  summarise(
+    variable = "bsn_tmmx",
+    n_rows = n(),
+    n_comids = n_distinct(comid),
+    min_date = min(date),
+    max_date = max(date),
+    pct_value = mean(!is.na(bsn_tmmx))
+  ) %>%
+  print()
+
+bsn_tmmn %>%
+  summarise(
+    variable = "bsn_tmmn",
+    n_rows = n(),
+    n_comids = n_distinct(comid),
+    min_date = min(date),
+    max_date = max(date),
+    pct_value = mean(!is.na(bsn_tmmn))
+  ) %>%
+  print()
+
+cat("\nDone.\n")
+```
+
+```{r build-catchment-and-basin-joined-files}
+# -------------------------------
+# Join catchment variable files
+# -------------------------------
+
+catch_files <- file.path(
+  meteo_catch_dir,
+  paste0(vars, "_daily.parquet")
+)
+
+drivers_catchments <- arrow::read_parquet(catch_files[1])
+
+for (f in catch_files[-1]) {
+  
+  cat("Joining catchment file:", f, "\n")
+  
+  tmp <- arrow::read_parquet(f)
+  
+  drivers_catchments <- dplyr::full_join(
+    drivers_catchments,
+    tmp,
+    by = c("comid", "date")
+  )
+  
+  rm(tmp)
+  gc()
+}
+
+catch_joined_file <- file.path(daily_drivers_dir, "drivers_catchments_joined.parquet")
+arrow::write_parquet(drivers_catchments, catch_joined_file)
+
+cat("Saved joined catchment drivers to:", catch_joined_file, "\n")
+
+rm(drivers_catchments)
+gc()
+
+
+# -------------------------------
+# Join basin variable files
+# -------------------------------
+
+basin_files <- file.path(
+  meteo_basin_dir,
+  paste0("bsn_", vars, "_daily.parquet")
+)
+
+drivers_basins <- arrow::read_parquet(basin_files[1])
+
+for (f in basin_files[-1]) {
+  
+  cat("Joining basin file:", f, "\n")
+  
+  tmp <- arrow::read_parquet(f)
+  
+  drivers_basins <- dplyr::full_join(
+    drivers_basins,
+    tmp,
+    by = c("comid", "date")
+  )
+  
+  rm(tmp)
+  gc()
+}
+
+basin_joined_file <- file.path(daily_drivers_dir, "drivers_basins_joined.parquet")
+arrow::write_parquet(drivers_basins, basin_joined_file)
+
+cat("Saved joined basin drivers to:", basin_joined_file, "\n")
+
+rm(drivers_basins)
+gc()
+```
+
+
+```{r final-join-from-disk}
+# Final catchment + basin join from disk
+con <- dbConnect(
+  duckdb::duckdb(),
+  dbdir = file.path(daily_drivers_dir, "meteo_join.duckdb")
+)
+
+catch_joined_file_sql <- gsub("\\\\", "/", normalizePath(catch_joined_file))
+basin_joined_file_sql <- gsub("\\\\", "/", normalizePath(basin_joined_file))
+
+drivers_out_file <- file.path(daily_drivers_dir, "drivers_daily_joined.parquet")
+drivers_out_file_sql <- gsub("\\\\", "/", drivers_out_file)
+
+dbExecute(con, paste0("
+CREATE OR REPLACE TABLE drivers_final AS
+SELECT
+  COALESCE(c.comid, b.comid) AS comid,
+  COALESCE(c.date, b.date) AS date,
+
+  c.pr,
+  c.srad,
+  c.vs,
+  c.vpd,
+  c.sph,
+  c.rmin,
+  c.rmax,
+
+  c.tmmx - 273.15 AS tmax_c,
+  c.tmmn - 273.15 AS tmin_c,
+  ((c.tmmx - 273.15) + (c.tmmn - 273.15)) / 2 AS tmean_c,
+
+  b.bsn_pr,
+  b.bsn_srad,
+  b.bsn_vs,
+  b.bsn_vpd,
+  b.bsn_sph,
+  b.bsn_rmin,
+  b.bsn_rmax,
+
+  b.bsn_tmmx - 273.15 AS bsn_tmax_c,
+  b.bsn_tmmn - 273.15 AS bsn_tmin_c,
+  ((b.bsn_tmmx - 273.15) + (b.bsn_tmmn - 273.15)) / 2 AS bsn_tmean_c
+
+FROM read_parquet('", catch_joined_file_sql, "') c
+FULL OUTER JOIN read_parquet('", basin_joined_file_sql, "') b
+USING (comid, date)
+"))
+
+dbExecute(con, paste0("
+COPY drivers_final
+TO '", drivers_out_file_sql, "'
+(FORMAT PARQUET, OVERWRITE_OR_IGNORE TRUE)
+"))
+
+dbDisconnect(con, shutdown = TRUE)
+
+cat("Saved final joined drivers to:", drivers_out_file, "\n")
+
+```
+
+```{r}
+drivers_final <- arrow::open_dataset(drivers_out_file)
+
+drivers_final %>%
+  head(10) %>%
+  collect()
+```
+
+```{r}
+# See what basin meteo files exist
+list.files(meteo_dir, pattern = "bsn|basins", full.names = FALSE)
+
+list.files(file.path(meteo_dir, "basins"), full.names = FALSE)
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+
+drivers_joined <- read_parquet(file.path(daily_drivers_dir, "drivers_daily_joined.parquet"))
+
+drivers_joined %>%
+  summarise(
+    n_rows = n(),
+    n_comids = n_distinct(comid),
+    min_date = min(date, na.rm = TRUE),
+    max_date = max(date, na.rm = TRUE),
+    
+    pct_tmean_c = mean(!is.na(tmean_c)),
+    pct_bsn_tmean_c = mean(!is.na(bsn_tmean_c)),
+    pct_both = mean(!is.na(tmean_c) & !is.na(bsn_tmean_c)),
+    pct_catchment_only = mean(!is.na(tmean_c) & is.na(bsn_tmean_c)),
+    pct_basin_only = mean(is.na(tmean_c) & !is.na(bsn_tmean_c))
+  )
+  
+```
+
+
