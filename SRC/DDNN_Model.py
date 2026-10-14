@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# DDNN_Model.py  (the model file)
+# STEP 8 of the pipeline (last script; runs AFTER Q_Processing_python.py).
+#
+# Purpose : train and evaluate a multitask Graph LSTM-GAT that predicts daily discharge (Q)
+#           and water temperature (T) on the routed NHDPlus network, then explain it with
+#           Graph-SHAP (feature, lag, node x feature and structural levels).
+# Inputs  : hydro_temp_data_trainval_2013plus.parquet   (NODES_PATH)
+#           edge_list.parquet                           (EDGES_PATH)
+# Outputs : trained model weights, scalers and features.pkl in SAVE_DIR;
+#           diagnostic figures and Graph-SHAP results in OUTPUTS_DIR
+#
+# Note    : the study area is the Illinois River Basin, HUC4 0712 + 0713 (the module docstring
+#           below mentions 0712 only).
+#
+# Comment style used in every script:
+#   ## N. Section   = major section of the script
+#   ### Step        = what the next block of code does
+#   #### Note       = why / assumptions / caveats for that step
+#   # inline        = short single-line bits next to the code
+#
 """
 DDNN_Model — Graph LSTM-GAT Multitask Model for Discharge & Water Temperature
 Illinois River Basin (HUC 0712 ) | Daily | 2013–present
@@ -10,16 +30,17 @@ Loss         : Weighted NSE-like (Q, 0.7) + MSE (Temp, 0.3) with masked supervis
 Explanation  : Full Graph-SHAP — feature, temporal, node×feature, and structural levels
 """
 
-# ── Standard library ──────────────────────────────────────────
+## 1. Imports
+### Standard library
 import os
 
-# ── Scientific stack ──────────────────────────────────────────
+### Scientific stack
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import joblib
 
-# ── PyTorch + graph ───────────────────────────────────────────
+### PyTorch + graph
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,32 +49,31 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.nn import GATConv
 from torch_geometric.utils import k_hop_subgraph
 
-# ── Sklearn ───────────────────────────────────────────────────
+### Sklearn
 from sklearn.preprocessing import MinMaxScaler
 import shap  # optional — retained for potential kernel-SHAP comparisons
 
 
-# ══════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════
+## 2. Configuration
 
-# ── Input data paths ──────────────────────────────────────────
-# Node table: daily COMID×date records with met drivers, discharge, and temperature.
-# Edge table: NHDPlus fromnode/tonode routing used to build the directed graph.
+### Input data paths
+#### Node table: daily COMID×date records with met drivers, discharge, and temperature.
+#### Edge table: NHDPlus fromnode/tonode routing used to build the directed graph.
+#### NOTE: NODES_PATH, EDGES_PATH, SAVE_DIR and OUTPUTS_DIR are hard-coded absolute paths; point them at your own project folders
 NODES_PATH = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_trainval_2013plus.parquet"
 EDGES_PATH = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/edge_list.parquet"
 
-# ── Temporal split & sequence ─────────────────────────────────
-# Temporal split: all windows whose target date falls before SPLIT_DATE go to
-# training; windows on or after go to the held-out test set. A 7-day lookback
-# gives the model enough recent memory without overextending sequence length.
+### Temporal split & sequence
+#### Temporal split: all windows whose target date falls before SPLIT_DATE go to
+#### training; windows on or after go to the held-out test set. A 7-day lookback
+#### gives the model enough recent memory without overextending sequence length.
 SPLIT_DATE   = pd.Timestamp("2025-01-01")
 LOOKBACK     = 7                            # days of antecedent input per window
 
-# ── Model hyperparameters ─────────────────────────────────────
-# Compact single-layer LSTM captures short-term temporal dynamics at each reach;
-# two stacked GAT layers then propagate those embeddings downstream through the
-# routed river graph.
+### Model hyperparameters
+#### Compact single-layer LSTM captures short-term temporal dynamics at each reach;
+#### two stacked GAT layers then propagate those embeddings downstream through the
+#### routed river graph.
 H_LSTM       = 64
 LSTM_LAYERS  = 1
 LSTM_DROPOUT = 0.2
@@ -62,58 +82,61 @@ H_GNN        = 64
 GNN_DROPOUT  = 0.2
 GAT_HEADS    = 4                            # multi-head attention in each GAT layer
 
-# ── Training schedule ─────────────────────────────────────────
+### Training schedule
 EPOCHS       = 200
 LR           = 1e-4
 BATCH_SIZE   = 1                            # one full graph window per step
 PATIENCE     = 10                           # early-stopping patience (epochs)
 
-# ── Modeling domain ───────────────────────────────────────────
-# Restricting to stream order ≥4 or 5 focuses the model on larger, better-observed
-# reaches to pair with remote sensing derived chl-a predictions
+### Modeling domain
+#### Restricting to stream order ≥4 or 5 focuses the model on larger, better-observed
+#### reaches to pair with remote sensing derived chl-a predictions
 STREAMORDER_MIN = 5
 
-# ── Feature groups ────────────────────────────────────────────
-# Meteorological drivers from GridMET: precipitation, radiation, wind, vapor
-# pressure, humidity, and basin-averaged precip. Temperature variables were
-# converted from Kelvin to °C; mean daily temp is derived from tmax/tmin.
-# PET (represented via Ra) captures atmospheric water demand beyond precip alone.
+### Feature groups
+#### Meteorological drivers from GridMET: precipitation, radiation, wind, vapor
+#### pressure, humidity, and basin-averaged precip. Temperature variables were
+#### converted from Kelvin to °C; mean daily temp is derived from tmax/tmin.
+#### PET (represented via Ra) captures atmospheric water demand beyond precip alone.
 BASE_FEATURES = [
     "pr", "srad", "vs", "vpd", "sph",
     "tmax_c", "tmin_c", "tmean_c",
     "rmin", "rmax", "Ra", "bsn_pr"
 ]
 
-# Static catchment attributes — fixed per COMID, constant through time.
+### Static catchment attributes
+#### Fixed per COMID, constant through time.
 STATIC_FEATURES = ["area_m2", "Slope", "LengthKM", "streamorde"]
 
-# Sine/cosine encoding of day-of-year: preserves the cyclical annual structure
-# so Dec 31 and Jan 1 remain adjacent rather than artificially far apart.
+### Seasonal features
+#### Sine/cosine encoding of day-of-year: preserves the cyclical annual structure
+#### so Dec 31 and Jan 1 remain adjacent rather than artificially far apart.
 SEASONAL_FEATURES = ["DOY_sin", "DOY_cos"]
 
-# ── Targets ───────────────────────────────────────────────────
+### Targets
 Q_COL    = "q_m3s_obs"
 T_COL    = "water_temp_C"
 TARGETS  = [Q_COL, T_COL]
 
-# Fixed task weights: discharge is the primary target (0.7); temperature is
-# secondary (0.3) but still requires the shared representation to learn it.
+### Task weights
+#### Fixed task weights: discharge is the primary target (0.7); temperature is
+#### secondary (0.3) but still requires the shared representation to learn it.
 TASK_WEIGHTS = torch.tensor([0.7, 0.3], dtype=torch.float32)
 
-# ── High-flow upweighting ─────────────────────────────────────
-# Ramps residual weight up to Q_HIGH_MAX_MULT for observations above the
-# threshold, helping the model better represent hydrologically important peaks.
+### High-flow upweighting
+#### Ramps residual weight up to Q_HIGH_MAX_MULT for observations above the
+#### threshold, helping the model better represent hydrologically important peaks.
 Q_HIGH_THRESH_M3S = 100.0
 Q_HIGH_MAX_MULT   = 5.0
 Q_HIGH_POWER      = 1.0
 
-# ── Graph smoothness regularization ──────────────────────────
-# Optional L2 penalty on predicted Q differences along directed edges.
-# Discourages physically implausible jumps in discharge across connected reaches.
+### Graph smoothness regularization
+#### Optional L2 penalty on predicted Q differences along directed edges.
+#### Discourages physically implausible jumps in discharge across connected reaches.
 USE_GRAPH_SMOOTHNESS = True
 LAMBDA_SMOOTH        = 1e-3                 # tune between 1e-4 and 1e-2
 
-# ── Output paths ──────────────────────────────────────────────
+### Output paths
 TARGET_COMID_FOR_PLOTS = 14787569           # COMID used for single-reach diagnostics
 
 SAVE_DIR    = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/models"
@@ -121,10 +144,10 @@ OUTPUTS_DIR = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/outputs"
 FEATURES_PATH       = os.path.join(SAVE_DIR, "features.pkl")
 EDGE_SUSPICIOUS_OUT = os.path.join(SAVE_DIR, "edge_suspicious_checks.csv")
 
-# ── Graph coarsening ──────────────────────────────────────────
-# When enabled, the full NHDPlus network is collapsed so edges connect only
-# modeled COMIDs; intermediate unobserved reaches are skipped by walking
-# downstream until the nearest observed connection is found.
+### Graph coarsening
+#### When enabled, the full NHDPlus network is collapsed so edges connect only
+#### modeled COMIDs; intermediate unobserved reaches are skipped by walking
+#### downstream until the nearest observed connection is found.
 USE_COARSENED_GRAPH = True
 MAX_HOPS_COARSEN    = 5000
 COARSE_MODE         = "nearest"
@@ -134,12 +157,11 @@ MODEL_FILENAME = "graph_lstm_gat_multitask_q_t_maskedloss_sigmoid_head.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ══════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ══════════════════════════════════════════════════════════════
+## 3. Utility functions
 
 SENTINEL_MISS = -9998.0
 
+### Replace -9998 sentinels with NaN
 def replace_sentinel_with_nan(df: pd.DataFrame, cols):
     """Replace -9998 sentinels with NaN in selected numeric columns."""
     df = df.copy()
@@ -149,6 +171,7 @@ def replace_sentinel_with_nan(df: pd.DataFrame, cols):
             df.loc[x == SENTINEL_MISS, c] = np.nan
     return df
 
+### Repair negative discharge by per-COMID interpolation
 def interpolate_negative_q_by_comid(
     df: pd.DataFrame,
     q_col: str,
@@ -195,6 +218,7 @@ def interpolate_negative_q_by_comid(
     }
     return out, summary
 
+### Sanity-print feature ranges
 def print_feature_sanity_ranges(nodes_df_raw: pd.DataFrame, FEATURES: list):
     """Quick sanity print for a few statics to catch order/magnitude issues early."""
     check_cols = [c for c in ["area_m2", "areasqkm", "Slope", "LengthKM", "streamorde"] if c in FEATURES]
@@ -209,6 +233,7 @@ def print_feature_sanity_ranges(nodes_df_raw: pd.DataFrame, FEATURES: list):
         else:
             print(f"{c:>10s}: min={np.min(v):.6g}  max={np.max(v):.6g}")
 
+### Scaler min / max diagnostic
 def scaler_feature_diagnostic(scaler: MinMaxScaler, FEATURES: list, max_lines=40):
     """Print scaler min/max pairs to verify they align with expected magnitudes."""
     if not hasattr(scaler, "data_min_") or not hasattr(scaler, "data_max_"):
@@ -230,6 +255,7 @@ def scaler_feature_diagnostic(scaler: MinMaxScaler, FEATURES: list, max_lines=40
         j = FEATURES.index(f)
         print(f"{f:>10s} | train_min={mins[j]:.6g}  train_max={maxs[j]:.6g}")
 
+### Build upstream -> downstream COMID edge pairs from fromnode / tonode
 def build_edge_pairs_from_nodes(edges_df: pd.DataFrame) -> pd.DataFrame:
     """
     Construct upstream->downstream COMID edges by joining on node ids:
@@ -247,6 +273,7 @@ def build_edge_pairs_from_nodes(edges_df: pd.DataFrame) -> pd.DataFrame:
     )
     return edge_pairs_all
 
+### Coarsen the network to edges between observed COMIDs
 def build_coarsened_edges(edge_pairs_all: pd.DataFrame, observed_comids: set,
                           max_hops=5000, mode="nearest") -> pd.DataFrame:
     """
@@ -292,6 +319,7 @@ def build_coarsened_edges(edge_pairs_all: pd.DataFrame, observed_comids: set,
 
     return pd.DataFrame(list(coarse_edges), columns=["comid_up", "comid_dn"])
 
+### Edge QA checks
 def edge_qa_checks(edge_pairs: pd.DataFrame, all_comids: np.ndarray) -> None:
     """Lightweight QA checks for edge health."""
     print("\n====================")
@@ -323,6 +351,7 @@ def edge_qa_checks(edge_pairs: pd.DataFrame, all_comids: np.ndarray) -> None:
     print(f"Duplicate edges: {dup_edges}")
     print("EDGE QA DONE.")
 
+### High-flow residual weights (computed in scaled Q space)
 def _q_highflow_weights_from_scaled(q_true_scaled: torch.Tensor,
                                    q_thresh_scaled: float,
                                    max_mult: float,
@@ -347,6 +376,7 @@ def _q_highflow_weights_from_scaled(q_true_scaled: torch.Tensor,
     w = 1.0 + (max_mult - 1.0) * frac
     return w
 
+### Graph smoothness loss on Q along directed edges
 def graph_smoothness_loss(yhat_q: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
     """L2 smoothness along directed edges: mean (q_u - q_v)^2."""
     if edge_index is None or edge_index.numel() == 0:
@@ -355,22 +385,20 @@ def graph_smoothness_loss(yhat_q: torch.Tensor, edge_index: torch.Tensor) -> tor
     return torch.mean((yhat_q[src] - yhat_q[dst]) ** 2)
 
 
-# ══════════════════════════════════════════════════════════════
-# STUDY AREA: DATA LOADING
-# ══════════════════════════════════════════════════════════════
-# Current domain: HUC 0712 (Upper Illinois, ~10,900 mi²) and HUC 0713
-# (Lower Illinois, ~17,700 mi²), together covering the full Illinois River
-# basin across Illinois, Indiana, Michigan, and Wisconsin.
+## 4. Study area and data loading
+#### Current domain: HUC 0712 (Upper Illinois, ~10,900 mi²) and HUC 0713
+#### (Lower Illinois, ~17,700 mi²), together covering the full Illinois River
+#### basin across Illinois, Indiana, Michigan, and Wisconsin.
 #
-# The workflow is configured to model this basin as a single hydrologic region,
-# restricting preprocessing, training, and evaluation to COMIDs within the
-# combined HUC 0712–0713 extent.  This provides a controlled setting for
-# debugging graph construction, validating data alignment, and assessing model
-# behavior before extending to additional sub-regions.
+#### The workflow is configured to model this basin as a single hydrologic region,
+#### restricting preprocessing, training, and evaluation to COMIDs within the
+#### combined HUC 0712–0713 extent.  This provides a controlled setting for
+#### debugging graph construction, validating data alignment, and assessing model
+#### behavior before extending to additional sub-regions.
 #
-# Node table: each row is a unique COMID × date combination containing daily
-# met drivers, observed discharge, and observed water temperature.
-# Edge table: NHDPlus fromnode/tonode routing used to derive the directed graph.
+#### Node table: each row is a unique COMID × date combination containing daily
+#### met drivers, observed discharge, and observed water temperature.
+#### Edge table: NHDPlus fromnode/tonode routing used to derive the directed graph.
 
 nodes_df_raw = pd.read_parquet(NODES_PATH)
 print("NODES_PATH:", NODES_PATH)
@@ -386,18 +414,19 @@ assert T_COL in nodes_df_raw.columns, f"{T_COL} missing"
 nodes_df_raw["date"] = pd.to_datetime(nodes_df_raw["date"])
 nodes_df_raw = nodes_df_raw.sort_values(["date", "comid"]).reset_index(drop=True)
 
-# Pre-QC range check — inspect raw target distributions before any repair or scaling
+### Pre-QC range check
+#### Inspect raw target distributions before any repair or scaling
 q_min_raw = pd.to_numeric(nodes_df_raw[Q_COL], errors="coerce").min()
 t_min_raw = pd.to_numeric(nodes_df_raw[T_COL], errors="coerce").min()
 
 print(f"Raw minimum {Q_COL}: {q_min_raw}")
 print(f"Raw minimum {T_COL}: {t_min_raw}")
 
-# ── Observed streamflow QC ────────────────────────────────────
-# Daily discharge from USGS NWIS was standardized and converted from cfs to
-# m³/s before joining to COMIDs.  Negative values are physically impossible;
-# they are treated as data errors, masked as NaN, and filled by linear
-# interpolation within each COMID's time series (interior gaps only).
+### Observed streamflow QC
+#### Daily discharge from USGS NWIS was standardized and converted from cfs to
+#### m³/s before joining to COMIDs.  Negative values are physically impossible;
+#### they are treated as data errors, masked as NaN, and filled by linear
+#### interpolation within each COMID's time series (interior gaps only).
 nodes_df_raw, q_repair_summary = interpolate_negative_q_by_comid(
     nodes_df_raw,
     q_col=Q_COL,
@@ -413,10 +442,10 @@ for k, v in q_repair_summary.items():
 print(f"Post-repair minimum {Q_COL}: {pd.to_numeric(nodes_df_raw[Q_COL], errors='coerce').min()}")
 print(f"Post-repair minimum {T_COL}: {pd.to_numeric(nodes_df_raw[T_COL], errors='coerce').min()}")
 
-# ── Water temperature QC ─────────────────────────────────────
-# Physically implausible temperature readings (below -5 °C or above 60 °C)
-# are nulled before masks and scalers are computed, preventing outliers from
-# corrupting the training signal or the scaled-space bounds.
+### Water temperature QC
+#### Physically implausible temperature readings (below -5 °C or above 60 °C)
+#### are nulled before masks and scalers are computed, preventing outliers from
+#### corrupting the training signal or the scaled-space bounds.
 TEMP_QC_MIN_C = -5.0
 TEMP_QC_MAX_C = 60.0
 
@@ -427,17 +456,17 @@ if bad_t.any():
           f"(<{TEMP_QC_MIN_C}C or >{TEMP_QC_MAX_C}C) before masks/scaling.")
     nodes_df_raw.loc[bad_t, T_COL] = np.nan
 
-# Snapshot observation availability before any imputation or scaling.
-# These boolean masks are the ground truth for which nodes/dates have real
-# observations; they gate the loss function so missing values are never
-# treated as true supervision signal.
+### Snapshot observation availability (before any imputation or scaling)
+#### These boolean masks are the ground truth for which nodes/dates have real
+#### observations; they gate the loss function so missing values are never
+#### treated as true supervision signal.
 nodes_df_raw["temp_avail_raw"] = ~nodes_df_raw[T_COL].isna()
 nodes_df_raw["q_avail_raw"]    = ~nodes_df_raw[Q_COL].isna()
 
-# ── Modeling domain: stream order filter ──────────────────────
-# Applied to both train and test to keep the domain consistent.
-# Restricting to order ≥ STREAMORDER_MIN focuses the model on larger,
-# better-observed reaches during initial development.
+### Modeling domain: stream order filter
+#### Applied to both train and test to keep the domain consistent.
+#### Restricting to order ≥ STREAMORDER_MIN focuses the model on larger,
+#### better-observed reaches during initial development.
 so_filter = pd.to_numeric(nodes_df_raw["streamorde"], errors="coerce")
 
 keep_rows = so_filter >= STREAMORDER_MIN
@@ -455,10 +484,10 @@ print(f"Dropped    : {n_before - n_after:,}")
 print(f"Unique COMIDs after filter: {nodes_df_raw['comid'].nunique():,}")
 print("Remaining stream orders:", sorted(nodes_df_raw["streamorde"].dropna().unique()))
 
-# ── Feature assembly ─────────────────────────────────────────
-# Final feature vector = met drivers + DOY seasonality + static catchment attrs.
-# Order is fixed here and persisted to disk so inference can reproduce the
-# exact scaler alignment used during training.
+### Feature assembly
+#### Final feature vector = met drivers + DOY seasonality + static catchment attrs.
+#### Order is fixed here and persisted to disk so inference can reproduce the
+#### exact scaler alignment used during training.
 FEATURES = BASE_FEATURES + SEASONAL_FEATURES + STATIC_FEATURES
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -467,7 +496,7 @@ missing_cols = [c for c in sorted(required_cols) if c not in nodes_df_raw.column
 if missing_cols:
     raise ValueError("Missing required columns in nodes_df_raw:\n" + "\n".join(missing_cols))
 
-# Ensure numeric coercion for FEATURES + TARGETS before dtype checks / scaling
+### Ensure numeric coercion for FEATURES + TARGETS before dtype checks / scaling
 for c in FEATURES + TARGETS:
     nodes_df_raw[c] = pd.to_numeric(nodes_df_raw[c], errors="coerce")
 
@@ -482,28 +511,25 @@ print(FEATURES)
 keep_cols = ["comid", "date"] + FEATURES + TARGETS + ["temp_avail_raw", "q_avail_raw"]
 nodes_df = nodes_df_raw[keep_cols].copy()
 
-# -------------------------
-# Replace -9998 with NA (recommended before scaling)
-# -------------------------
+### Replace -9998 sentinels with NaN
+#### Recommended before scaling
 nodes_df = replace_sentinel_with_nan(nodes_df, FEATURES + TARGETS)
 print_feature_sanity_ranges(nodes_df, FEATURES)
 
-# ══════════════════════════════════════════════════════════════
-# GRAPH TOPOLOGY CONSTRUCTION
-# ══════════════════════════════════════════════════════════════
-# The directed graph encodes the routed river network: nodes are COMIDs,
-# edges follow upstream → downstream flow direction derived from NHDPlus
-# fromnode/tonode identifiers.  When coarsening is enabled, intermediate
-# unobserved reaches are collapsed so every edge connects two modeled COMIDs.
+## 5. Graph construction
+#### The directed graph encodes the routed river network: nodes are COMIDs,
+#### edges follow upstream → downstream flow direction derived from NHDPlus
+#### fromnode/tonode identifiers.  When coarsening is enabled, intermediate
+#### unobserved reaches are collapsed so every edge connects two modeled COMIDs.
 
-# ── COMID → integer index mapping ────────────────────────────
+### COMID → integer index mapping
 all_comids = np.sort(nodes_df["comid"].unique())
 comid_to_idx = {c: i for i, c in enumerate(all_comids)}
 n_nodes = len(all_comids)
 
-# ── Edge construction ─────────────────────────────────────────
-# Match each reach's tonode to the downstream reach's fromnode to get directed
-# upstream→downstream COMID pairs, then optionally coarsen to observed nodes.
+### Edge construction
+#### Match each reach's tonode to the downstream reach's fromnode to get directed
+#### upstream→downstream COMID pairs, then optionally coarsen to observed nodes.
 edge_pairs_all = build_edge_pairs_from_nodes(edges_df)
 
 edge_pairs_direct = edge_pairs_all[
@@ -545,13 +571,11 @@ edge_qa_checks(edge_pairs, all_comids)
 if edge_index.numel() == 0:
     raise RuntimeError("edge_index is empty. Ensure edges exist and USE_COARSENED_GRAPH settings are correct.")
 
-# ══════════════════════════════════════════════════════════════
-# FEATURE SCALING
-# ══════════════════════════════════════════════════════════════
-# MinMaxScaler is fit on training rows only to prevent data leakage.
-# NaN values are temporarily filled with 0 for scaler mechanics; actual
-# supervision is gated by the pre-computed availability masks so those
-# filled values never act as true training signal.
+## 6. Feature scaling
+#### MinMaxScaler is fit on training rows only to prevent data leakage.
+#### NaN values are temporarily filled with 0 for scaler mechanics; actual
+#### supervision is gated by the pre-computed availability masks so those
+#### filled values never act as true training signal.
 
 train_mask_rows = nodes_df["date"] < SPLIT_DATE
 if train_mask_rows.sum() == 0:
@@ -570,13 +594,13 @@ if hasattr(scaler_X, "n_features_in_") and scaler_X.n_features_in_ != len(FEATUR
 
 scaler_feature_diagnostic(scaler_X, FEATURES, max_lines=40)
 
-# Transform all rows using train-fitted scalers
+### Transform all rows using train-fitted scalers
 X_all = np.nan_to_num(nodes_df[FEATURES].values, nan=0.0)
 Y_all = np.nan_to_num(nodes_df[TARGETS].values, nan=0.0)
 nodes_df[FEATURES] = scaler_X.transform(X_all)
 nodes_df[TARGETS]  = scaler_y.transform(Y_all)
 
-# Precompute scaled threshold for high-flow Q weighting
+### Precompute scaled threshold for high-flow Q weighting
 q_idx = TARGETS.index(Q_COL)
 q_min = float(scaler_y.data_min_[q_idx])
 q_max = float(scaler_y.data_max_[q_idx])
@@ -590,14 +614,12 @@ print(f"  scaler_y q_min/q_max = {q_min:.6g} / {q_max:.6g}")
 print(f"  q_thresh_scaled = {q_thresh_scaled:.6f}")
 print(f"  Q_HIGH_MAX_MULT = {Q_HIGH_MAX_MULT}, Q_HIGH_POWER = {Q_HIGH_POWER}")
 
-# ══════════════════════════════════════════════════════════════
-# TENSOR ASSEMBLY
-# ══════════════════════════════════════════════════════════════
-# Reshape the scaled node table into dense arrays for graph-sequence modeling:
-#   X_TNF  [T, N, F] — predictors at every time step and node
-#   Y_TN2  [T, N, 2] — discharge and temperature targets
-#   Qmask  [T, N]    — True where discharge observations exist
-#   Tmask  [T, N]    — True where temperature observations exist
+## 7. Tensor assembly
+#### Reshape the scaled node table into dense arrays for graph-sequence modeling:
+####   X_TNF  [T, N, F] — predictors at every time step and node
+####   Y_TN2  [T, N, 2] — discharge and temperature targets
+####   Qmask  [T, N]    — True where discharge observations exist
+####   Tmask  [T, N]    — True where temperature observations exist
 dates = np.sort(nodes_df["date"].unique())
 Tsteps = len(dates)
 Fdim = len(FEATURES)
@@ -622,14 +644,12 @@ for d in dates:
     Tmask_TN[t, idxs] = sub["temp_avail_raw"].to_numpy(dtype=bool)
     Qmask_TN[t, idxs] = sub["q_avail_raw"].to_numpy(dtype=bool)
 
-# ══════════════════════════════════════════════════════════════
-# TRAIN–TEST DATASET CONSTRUCTION
-# ══════════════════════════════════════════════════════════════
-# Each sample is a 7-day input window across all nodes ending at time t,
-# paired with targets for that final day.  The split is strictly temporal:
-# windows whose target date falls before SPLIT_DATE go to training; all
-# others go to the held-out test set.  Because each batch spans the full
-# graph, BATCH_SIZE = 1 (one window = one graph time step).
+## 8. Train–test datasets
+#### Each sample is a 7-day input window across all nodes ending at time t,
+#### paired with targets for that final day.  The split is strictly temporal:
+#### windows whose target date falls before SPLIT_DATE go to training; all
+#### others go to the held-out test set.  Because each batch spans the full
+#### graph, BATCH_SIZE = 1 (one window = one graph time step).
 class GraphSeqDataset(Dataset):
     def __init__(self, X_TNF, Y_TN2, Tmask_TN, Qmask_TN, lookback, dates):
         self.X = X_TNF
@@ -679,18 +699,16 @@ test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False)
 print(f"\nTraining on {len(train_ds)} time steps (< {SPLIT_DATE.date()}); "
       f"testing on {len(test_ds)} time steps (≥ {SPLIT_DATE.date()}).")
 
-# ══════════════════════════════════════════════════════════════
-# MODEL ARCHITECTURE  —  Graph LSTM + GAT Multitask Network
-# ══════════════════════════════════════════════════════════════
-# For each node, the 7-day feature sequence is passed through an LSTM to
-# encode short-term temporal dynamics (Kratzert et al., 2018).  The final
-# hidden state becomes that node's embedding for the current day.  Two
-# stacked GAT layers then propagate those embeddings downstream through the
-# directed river graph (Veličković et al., 2018; Jia et al., 2021), so each
-# reach can receive information from its upstream neighbors.  A linear head
-# maps the updated embeddings to two outputs (Q, T), and a sigmoid activation
-# bounds both predictions to [0, 1] in scaled space — added after observing
-# exploding predictions during early model development.
+## 9. Model architecture (Graph LSTM + GAT multitask)
+#### For each node, the 7-day feature sequence is passed through an LSTM to
+#### encode short-term temporal dynamics (Kratzert et al., 2018).  The final
+#### hidden state becomes that node's embedding for the current day.  Two
+#### stacked GAT layers then propagate those embeddings downstream through the
+#### directed river graph (Veličković et al., 2018; Jia et al., 2021), so each
+#### reach can receive information from its upstream neighbors.  A linear head
+#### maps the updated embeddings to two outputs (Q, T), and a sigmoid activation
+#### bounds both predictions to [0, 1] in scaled space — added after observing
+#### exploding predictions during early model development.
 class GraphLSTM_MTL(nn.Module):
     def __init__(self, in_dim, lstm_hidden, lstm_layers, lstm_dropout,
                  gnn_hidden, gnn_dropout, heads=4, out_dim=2):
@@ -734,17 +752,15 @@ model = GraphLSTM_MTL(
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=6)
 
-# ══════════════════════════════════════════════════════════════
-# LOSS FUNCTION & REGULARIZATION
-# ══════════════════════════════════════════════════════════════
-# Discharge uses a weighted NSE-like term (numerator = weighted MSE,
-# denominator = weighted variance of observations) so the model is penalized
-# relative to the variance of the observed signal.  Temperature uses standard
-# MSE.  Both terms are masked so only observed nodes contribute to that step's
-# gradient.  Task weights (0.7 Q / 0.3 T) keep discharge as the primary
-# objective while still requiring the shared representation to learn temperature
-# (Sadler et al., 2022).  High-flow upweighting and the optional graph
-# smoothness penalty are applied on top of this base loss.
+## 10. Loss function and regularization
+#### Discharge uses a weighted NSE-like term (numerator = weighted MSE,
+#### denominator = weighted variance of observations) so the model is penalized
+#### relative to the variance of the observed signal.  Temperature uses standard
+#### MSE.  Both terms are masked so only observed nodes contribute to that step's
+#### gradient.  Task weights (0.7 Q / 0.3 T) keep discharge as the primary
+#### objective while still requiring the shared representation to learn temperature
+#### (Sadler et al., 2022).  High-flow upweighting and the optional graph
+#### smoothness penalty are applied on top of this base loss.
 def nse_mse_mixed_loss(yhat, ytrue, w_task, mask_t=None, mask_q=None,
                        q_thresh_scaled=0.0, q_max_mult=1.0, q_power=1.0, eps=1e-8):
     """
@@ -791,15 +807,13 @@ def nse_mse_mixed_loss(yhat, ytrue, w_task, mask_t=None, mask_q=None,
     total = (wq_use / wsum) * nse_term_q + (wt_use / wsum) * mse_t
     return total, nse_term_q.detach(), mse_t.detach()
 
-# ══════════════════════════════════════════════════════════════
-# TRAINING PROCEDURE
-# ══════════════════════════════════════════════════════════════
-# Adam optimizer with ReduceLROnPlateau scheduling.  At each epoch the script
-# iterates through all training windows, computes the multitask masked loss,
-# optionally adds the graph smoothness penalty, and updates weights.  Validation
-# is run on the held-out test windows after every epoch; early stopping fires
-# if validation loss does not improve within PATIENCE epochs.  The best model
-# state is retained and reloaded at the end of training.
+## 11. Training
+#### Adam optimizer with ReduceLROnPlateau scheduling.  At each epoch the script
+#### iterates through all training windows, computes the multitask masked loss,
+#### optionally adds the graph smoothness penalty, and updates weights.  Validation
+#### is run on the held-out test windows after every epoch; early stopping fires
+#### if validation loss does not improve within PATIENCE epochs.  The best model
+#### state is retained and reloaded at the end of training.
 best_val = float("inf")
 best_state = None
 epochs_no_improve = 0
@@ -882,13 +896,12 @@ if best_state is not None:
     model.load_state_dict(best_state)
     model.to(device)
 
-# ══════════════════════════════════════════════════════════════
-# EVALUATION IN PHYSICAL UNITS
-# ══════════════════════════════════════════════════════════════
-# Predictions and targets are inverse-transformed back to original units.
-# Metrics (NSE, RMSE, MAE) are computed only at nodes and dates where
-# observations exist, using the pre-computed masks.  Stream-order breakdowns
-# let us assess whether model performance changes across network scale.
+## 12. Evaluation in physical units
+#### Predictions and targets are inverse-transformed back to original units.
+#### Metrics (NSE, RMSE, MAE) are computed only at nodes and dates where
+#### observations exist, using the pre-computed masks.  Stream-order breakdowns
+#### let us assess whether model performance changes across network scale.
+### Metric helpers (NSE, RMSE, MAE)
 def nse_numpy(sim, obs):
     num = np.sum((sim - obs) ** 2)
     den = np.sum((obs - np.mean(obs)) ** 2) + 1e-12
@@ -926,6 +939,7 @@ print("\n=== Scaled prediction bounds check (should be within [0,1]) ===")
 print(f"Q_scaled pred min/max: {preds_scaled[:,:,0].min():.6f} / {preds_scaled[:,:,0].max():.6f}")
 print(f"T_scaled pred min/max: {preds_scaled[:,:,1].min():.6f} / {preds_scaled[:,:,1].max():.6f}")
 
+### Inverse-transform scaled predictions back to physical units
 def inverse_two_columns(arr_2):
     flat = arr_2.reshape(-1, 2)
     inv  = scaler_y.inverse_transform(flat)
@@ -962,10 +976,10 @@ print("\n=== Test Metrics (original units; observed-only) ===")
 print(f"Q    -> NSE: {q_nse:.4f} | RMSE: {q_rmse:.4f} | MAE: {q_mae:.4f} | n_obs={int(mask_q.sum())}")
 print(f"Temp -> NSE: {t_nse:.4f} | RMSE: {t_rmse:.4f} | MAE: {t_mae:.4f} | n_obs={int(mask_t.sum())}")
 
-# ── Metrics by stream order ───────────────────────────────────
-# Stratifying by stream order reveals whether the model is stronger on
-# larger reaches (higher order) versus smaller tributaries (lower order),
-# which informs where the domain should be extended or constrained.
+### Metrics by stream order
+#### Stratifying by stream order reveals whether the model is stronger on
+#### larger reaches (higher order) versus smaller tributaries (lower order),
+#### which informs where the domain should be extended or constrained.
 def calc_metrics(obs, pred):
     if len(obs) == 0:
         return {"n_obs": 0, "NSE": np.nan, "RMSE": np.nan, "MAE": np.nan}
@@ -1032,14 +1046,12 @@ print(f"Pred Q < 0 count: {int((pred_q < 0).sum())} / {pred_q.size}")
 print(f"Pred Temp < 0 count: {int((pred_t < 0).sum())} / {pred_t.size}")
 print(f"Pred Temp > 40 count: {int((pred_t > 40).sum())} / {pred_t.size}")
 
-# ══════════════════════════════════════════════════════════════
-# DIAGNOSTIC VISUALIZATIONS
-# ══════════════════════════════════════════════════════════════
-# Generates single-COMID hydrographs, observed-vs-predicted scatterplots,
-# and observed-distribution histograms.  All figures are written directly to
-# OUTPUTS_DIR so the full script can run uninterrupted without manual figure
-# closing.  The histogram view applies the same preprocessing rules used
-# during training so what you inspect matches what the model saw.
+## 13. Diagnostic plots
+#### Generates single-COMID hydrographs, observed-vs-predicted scatterplots,
+#### and observed-distribution histograms.  All figures are written directly to
+#### OUTPUTS_DIR so the full script can run uninterrupted without manual figure
+#### closing.  The histogram view applies the same preprocessing rules used
+#### during training so what you inspect matches what the model saw.
 if TARGET_COMID_FOR_PLOTS not in comid_to_idx:
     raise ValueError(f"COMID {TARGET_COMID_FOR_PLOTS} not found in dataset.")
 
@@ -1105,7 +1117,7 @@ plt.tight_layout()
 plt.savefig(os.path.join(OUTPUTS_DIR, "scatter_T.png"), dpi=150, bbox_inches="tight")
 plt.close()
 
-# ── Observed-distribution histograms (log-y) ─────────────────
+### Observed-distribution histograms (log-y)
 def plot_obs_histograms_logy(nodes_df_in, q_col="q_m3s_obs", t_col="water_temp_C",
                              bins_q=250, bins_t=200, title_suffix="(all observations)",
                              save_dir=None):
@@ -1141,11 +1153,11 @@ nodes_raw = pd.read_parquet(NODES_PATH)
 nodes_raw["date"] = pd.to_datetime(nodes_raw["date"])
 nodes_raw = replace_sentinel_with_nan(nodes_raw, [Q_COL, T_COL])
 
-# Match modeling-domain filter
+### Match modeling-domain filter
 nodes_raw["streamorde"] = pd.to_numeric(nodes_raw["streamorde"], errors="coerce")
 nodes_raw = nodes_raw.loc[nodes_raw["streamorde"] >= STREAMORDER_MIN].copy()
 
-# Apply same Q repair to histogram view so what you inspect matches training preprocessing
+### Apply same Q repair to histogram view so what you inspect matches training preprocessing
 nodes_raw, _ = interpolate_negative_q_by_comid(
     nodes_raw, q_col=Q_COL, date_col="date", comid_col="comid", q_floor=0.0
 )
@@ -1160,12 +1172,10 @@ plot_obs_histograms_logy(
     save_dir=OUTPUTS_DIR,
 )
 
-# ══════════════════════════════════════════════════════════════
-# MODEL PERSISTENCE
-# ══════════════════════════════════════════════════════════════
-# Model weights, both scalers, and the feature list (order-critical for
-# inference) are written to SAVE_DIR.  Reloading all three is necessary to
-# reproduce predictions outside this script.
+## 14. Save the model
+#### Model weights, both scalers, and the feature list (order-critical for
+#### inference) are written to SAVE_DIR.  Reloading all three is necessary to
+#### reproduce predictions outside this script.
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 torch.save(model.state_dict(), os.path.join(SAVE_DIR, MODEL_FILENAME))
@@ -1178,37 +1188,33 @@ print(f"Graph smoothness: {USE_GRAPH_SMOOTHNESS} (lambda={LAMBDA_SMOOTH})")
 print("Output head: sigmoid on BOTH Q and Temp (scaled-space bounded)")
 
 
-# ══════════════════════════════════════════════════════════════
-# GRAPH-SHAP INTERPRETATION
-# ══════════════════════════════════════════════════════════════
-# Standard SHAP is insufficient for a graph model because once message
-# passing is used, the prediction at a node is influenced by upstream
-# neighbors — not just that node's own inputs.  This block implements a
-# three-level Monte Carlo Shapley framework that respects graph structure:
+## 15. Graph-SHAP interpretation
+#### Standard SHAP is insufficient for a graph model because once message
+#### passing is used, the prediction at a node is influenced by upstream
+#### neighbors — not just that node's own inputs.  This block implements a
+#### three-level Monte Carlo Shapley framework that respects graph structure:
 #
-#   Level 1  Feature Graph-SHAP   — MC Shapley over feature blocks at the
-#            target node (all lags of pr, all lags of tmax, etc.)
-#   Level 2  Temporal Graph-SHAP  — MC Shapley over lag blocks
-#            (all features at t-6, t-5, … t)
-#   Level 3  Node×Feature Heatmap — MC Shapley over every
-#            (upstream_node, feature) pair in the k-hop subgraph
-#   Structural                    — MC Shapley over incoming edges,
-#            capturing synergy / redundancy that leave-one-out misses
+####   Level 1  Feature Graph-SHAP   — MC Shapley over feature blocks at the
+####            target node (all lags of pr, all lags of tmax, etc.)
+####   Level 2  Temporal Graph-SHAP  — MC Shapley over lag blocks
+####            (all features at t-6, t-5, … t)
+####   Level 3  Node×Feature Heatmap — MC Shapley over every
+####            (upstream_node, feature) pair in the k-hop subgraph
+####   Structural                    — MC Shapley over incoming edges,
+####            capturing synergy / redundancy that leave-one-out misses
 #
-# Key design choices
-# ──────────────────
-#  • Players are grouped blocks rather than raw lb×F scalar cells,
-#    reducing dimensionality and keeping results interpretable.
-#  • Absent players are replaced with randomly drawn seasonal background
-#    windows (not a fixed mean), making the masking more realistic.
-#  • All explanations are restricted to a k-hop upstream subgraph so the
-#    explanation respects the local routed neighborhood the model uses.
-#  • Returns signed mean + 95 % CI so direction and uncertainty are visible.
-#  • compute_edge_ablation_importance is retained as a fast sanity check;
-#    compute_structural_graphshap_mc is the true Shapley version.
-# ══════════════════════════════════════════════════════════════
+#### Key design choices
+####  • Players are grouped blocks rather than raw lb×F scalar cells,
+####    reducing dimensionality and keeping results interpretable.
+####  • Absent players are replaced with randomly drawn seasonal background
+####    windows (not a fixed mean), making the masking more realistic.
+####  • All explanations are restricted to a k-hop upstream subgraph so the
+####    explanation respects the local routed neighborhood the model uses.
+####  • Returns signed mean + 95 % CI so direction and uncertainty are visible.
+####  • compute_edge_ablation_importance is retained as a fast sanity check;
+####    compute_structural_graphshap_mc is the true Shapley version.
 
-# ── tuneable knobs ────────────────────────────────────────────
+### 15.1 Tuneable knobs
 GRAPHSHAP_N_HOPS         = 2      # upstream subgraph depth
 GRAPHSHAP_N_BACKGROUND   = 40     # distinct windows in masker pool
 GRAPHSHAP_N_EXPLAIN      = 25     # windows to average Shapley over
@@ -1217,14 +1223,13 @@ GRAPHSHAP_N_MC_STRUCT    = 100    # permutations for structural SHAP
 GRAPHSHAP_N_MC_NF        = 60     # permutations for node×feature
 GRAPHSHAP_MAX_NF_PLAYERS = 100    # skip node×feature if larger
 GRAPHSHAP_SEASON_DAYS    = 45     # ±days for seasonal background
-# ─────────────────────────────────────────────────────────────
 
 
-# ── 1. Local upstream subgraph extraction ────────────────────
-# Extract a k-hop upstream neighborhood around the target node.  Because the
-# graph is directed upstream → downstream, only nodes that can influence the
-# target through routing are included — downstream nodes are excluded.  This
-# keeps the explanation local while preserving the relevant routed structure.
+### 15.2 Local upstream subgraph extraction
+#### Extract a k-hop upstream neighborhood around the target node.  Because the
+#### graph is directed upstream → downstream, only nodes that can influence the
+#### target through routing are included — downstream nodes are excluded.  This
+#### keeps the explanation local while preserving the relevant routed structure.
 
 def extract_upstream_subgraph(edge_index, target_node_idx, n_hops=2):
     """
@@ -1248,12 +1253,12 @@ def extract_upstream_subgraph(edge_index, target_node_idx, n_hops=2):
     return sub_nodes, edge_index_sub, target_sub_idx
 
 
-# ── 2. Player (block) definitions ────────────────────────────
-# Players are grouped blocks rather than raw lb×F scalar cells, which reduces
-# the coalition space and makes results interpretable at the feature, lag, or
-# node×feature level.  Each player is a 3-tuple:
-#   (name, global_node_idx, [flat_indices])
-# where flat_index = lag * n_features + feat_idx  (row-major over [lb, F])
+### 15.3 Player (block) definitions
+#### Players are grouped blocks rather than raw lb×F scalar cells, which reduces
+#### the coalition space and makes results interpretable at the feature, lag, or
+#### node×feature level.  Each player is a 3-tuple:
+####   (name, global_node_idx, [flat_indices])
+#### where flat_index = lag * n_features + feat_idx  (row-major over [lb, F])
 
 def make_feature_blocks(target_node_idx, lookback, features):
     """One player per feature — pools all lags of that feature."""
@@ -1264,6 +1269,7 @@ def make_feature_blocks(target_node_idx, lookback, features):
         for f_idx, f_name in enumerate(features)
     ]
 
+### Lag blocks (one player per time lag)
 def make_lag_blocks(target_node_idx, lookback, features):
     """One player per lag — pools all features at that time step."""
     F = len(features)
@@ -1274,6 +1280,7 @@ def make_lag_blocks(target_node_idx, lookback, features):
         for lag in range(lookback)
     ]
 
+### Node x feature blocks (one player per node-feature pair)
 def make_node_feature_blocks(sub_nodes_global, features, target_node_idx, lookback):
     """One player per (node, feature) — all lags of feature f at node n."""
     F = len(features)
@@ -1289,10 +1296,10 @@ def make_node_feature_blocks(sub_nodes_global, features, target_node_idx, lookba
     return blocks
 
 
-# ── 3. Seasonal background pool ──────────────────────────────
-# Background windows are drawn from seasonally similar periods (±season_window_days
-# of day-of-year) rather than random dates, making the absent-player baseline
-# more realistic than a fixed mean or a fully random sample.
+### 15.4 Seasonal background pool
+#### Background windows are drawn from seasonally similar periods (±season_window_days
+#### of day-of-year) rather than random dates, making the absent-player baseline
+#### more realistic than a fixed mean or a fully random sample.
 
 def build_background_pool(X_TNF, test_indices, dates, sub_nodes_global,
                           lookback, n_samples, target_date=None,
@@ -1333,12 +1340,13 @@ def build_background_pool(X_TNF, test_indices, dates, sub_nodes_global,
     return bg_pool, list(chosen)
 
 
-# ── 4. Graph-aware coalition reconstructor ───────────────────
-# Absent players → background values; present players → actual explain values.
-# Masking is graph-aware: all subgraph nodes start from background, then only
-# the coalition members have their explain-window values restored.  This keeps
-# the explanation grounded in the local routed neighborhood.
+### 15.5 Graph-aware coalition reconstructor
+#### Absent players → background values; present players → actual explain values.
+#### Masking is graph-aware: all subgraph nodes start from background, then only
+#### the coalition members have their explain-window values restored.  This keeps
+#### the explanation grounded in the local routed neighborhood.
 
+#### NOTE: this function is defined a second time in the Graph-SHAP utilities below; the later definition is the one in effect
 def reconstruct_from_coalition(
     coalition_mask,      # bool [n_players]
     player_blocks,       # list of (name, node_g, flat_idxs)
@@ -1373,12 +1381,12 @@ def reconstruct_from_coalition(
     return x_win   # [N, lb, F]  on device
 
 
-# ── 5. Monte Carlo Shapley core ──────────────────────────────
-# Shared estimator used by all three feature levels.  For each explain window,
-# random player orderings are sampled and the marginal contribution of each
-# player is accumulated as it enters the coalition.  Repeating across windows
-# yields a signed mean with a 95 % CI so both magnitude and direction are
-# visible in the final output.
+### 15.6 Monte Carlo Shapley core
+#### Shared estimator used by all three feature levels.  For each explain window,
+#### random player orderings are sampled and the marginal contribution of each
+#### player is accumulated as it enters the coalition.  Repeating across windows
+#### yields a signed mean with a 95 % CI so both magnitude and direction are
+#### visible in the final output.
 
 def mc_shapley_over_blocks(
     model, edge_index,
@@ -1472,11 +1480,11 @@ def mc_shapley_over_blocks(
     return shap_mean, shap_std, shap_ci95
 
 
-# ── 6. Structural Graph-SHAP — MC Shapley over incoming edges ─
-# Separates the role of graph structure from node features by computing
-# true Shapley values over the set of incoming edges to the target node.
-# Captures synergy and redundancy among upstream connections that a simple
-# leave-one-edge-out ablation cannot detect.
+### 15.7 Structural Graph-SHAP — MC Shapley over incoming edges
+#### Separates the role of graph structure from node features by computing
+#### true Shapley values over the set of incoming edges to the target node.
+#### Captures synergy and redundancy among upstream connections that a simple
+#### leave-one-edge-out ablation cannot detect.
 
 def compute_structural_graphshap_mc(
     model, edge_index,
@@ -1552,11 +1560,11 @@ def compute_structural_graphshap_mc(
     return shap_mean, shap_std, shap_ci95, edge_players
 
 
-# ── 7. Edge ablation — fast structural sanity check ──────────
-# Single-edge leave-one-out ablation: much faster than full Shapley but
-# cannot capture edge interactions.  Use this to quickly verify that the
-# broader pattern of structural Shapley results is consistent, or when the
-# number of incoming edges makes MC Shapley too expensive.
+### 15.8 Edge ablation — fast structural sanity check
+#### Single-edge leave-one-out ablation: much faster than full Shapley but
+#### cannot capture edge interactions.  Use this to quickly verify that the
+#### broader pattern of structural Shapley results is consistent, or when the
+#### number of incoming edges makes MC Shapley too expensive.
 
 def compute_edge_ablation_importance(
     model, edge_index, x_win_sample,
@@ -1586,12 +1594,12 @@ def compute_edge_ablation_importance(
     return scores, baseline
 
 
-# ── 8. Graph-SHAP visualization helpers ──────────────────────
-# Ranked horizontal bar charts with 95 % CI error bars for all Shapley levels.
-# Node×feature results also render as a diverging-color heatmap so the spatial
-# pattern of upstream influence is immediately visible.  All outputs are saved
-# to OUTPUTS_DIR; plt.show() is replaced with plt.close() so plots never block
-# script execution.
+### 15.9 Graph-SHAP visualization helpers
+#### Ranked horizontal bar charts with 95 % CI error bars for all Shapley levels.
+#### Node×feature results also render as a diverging-color heatmap so the spatial
+#### pattern of upstream influence is immediately visible.  All outputs are saved
+#### to OUTPUTS_DIR; plt.show() is replaced with plt.close() so plots never block
+#### script execution.
 
 def plot_graphshap_bars(shap_mean, shap_ci95, player_names,
                         title, xlabel="Mean Shapley value (signed)",
@@ -1627,6 +1635,7 @@ def plot_graphshap_bars(shap_mean, shap_ci95, player_names,
     return fig
 
 
+### Node x feature heatmap plot
 def plot_node_feature_heatmap(shap_mean, player_blocks_nf,
                                sub_nodes_global, features_list,
                                target_node_idx, idx_to_comid,
@@ -1663,10 +1672,9 @@ def plot_node_feature_heatmap(shap_mean, player_blocks_nf,
     plt.close(fig)
     return fig
 
-# ─────────────────────────────────────────────────────────────
-# Graph-SHAP utilities
-# ─────────────────────────────────────────────────────────────
+### 15.10 Graph-SHAP utilities
 
+#### NOTE: redefinition of reconstruct_from_coalition from 15.5; this later version overrides the earlier one
 def reconstruct_from_coalition(
     coalition_mask,
     player_blocks,
@@ -1803,20 +1811,20 @@ def reconstruct_from_coalition(
     return torch.tensor(x_rec, dtype=torch.float32, device=device)
 
 
-# ── 9. Graph-SHAP runner ─────────────────────────────────────
-# Orchestrates all four explanation levels for each target variable (Q, Temp)
-# at TARGET_COMID_FOR_PLOTS. The upstream subgraph is extracted once and then
-# all block-based Graph-SHAP runs are performed in LOCAL subgraph index space
-# to avoid global/local node-index mismatches.
+### 15.11 Graph-SHAP runner
+#### Orchestrates all four explanation levels for each target variable (Q, Temp)
+#### at TARGET_COMID_FOR_PLOTS. The upstream subgraph is extracted once and then
+#### all block-based Graph-SHAP runs are performed in LOCAL subgraph index space
+#### to avoid global/local node-index mismatches.
 #
-# IMPORTANT:
-# The internal Graph-SHAP utilities expect block definitions in the form:
-#     (name, node_idx, flat_positions)
-# where:
-#     flat_idx = lag_idx * n_features + feat_idx
+#### IMPORTANT:
+#### The internal Graph-SHAP utilities expect block definitions in the form:
+####     (name, node_idx, flat_positions)
+#### where:
+####     flat_idx = lag_idx * n_features + feat_idx
 #
-# Therefore we DO NOT convert blocks to (node, lag, feat) triplets here.
-# We only remap node_idx from global graph indexing to local subgraph indexing.
+#### Therefore we DO NOT convert blocks to (node, lag, feat) triplets here.
+#### We only remap node_idx from global graph indexing to local subgraph indexing.
 
 print("\n" + "=" * 65)
 print("FULL GRAPH-SHAP  —  three-level analysis")
@@ -1826,9 +1834,7 @@ idx_to_comid      = {v: k for k, v in comid_to_idx.items()}
 target_node_idx_g = comid_to_idx[TARGET_COMID_FOR_PLOTS]
 
 
-# ──────────────────────────────────────────────────────────────
-# Helper utilities for consistent local-subgraph Graph-SHAP
-# ──────────────────────────────────────────────────────────────
+### 15.12 Helper utilities for consistent local-subgraph Graph-SHAP
 def build_local_subgraph_inputs(X_TNF, sub_nodes_g):
     """
     Restrict full [T, N, F] tensor to local upstream subgraph order.
@@ -1838,6 +1844,7 @@ def build_local_subgraph_inputs(X_TNF, sub_nodes_g):
     return X_TNF[:, sub_nodes_np, :].astype(np.float32)
 
 
+### Decode flat positions into (lag, feature) for diagnostics
 def flat_positions_to_lag_feat(flat_positions, n_features):
     """
     Decode flat positions into (lag_idx, feat_idx) for diagnostics only.
@@ -1853,6 +1860,7 @@ def flat_positions_to_lag_feat(flat_positions, n_features):
     return out
 
 
+### Remap blocks from global to local subgraph node indexing
 def remap_any_blocks_to_local(blocks_global, global_to_local, label="blocks"):
     """
     Remap block definitions from global node indexing to local subgraph indexing
@@ -1899,6 +1907,7 @@ def remap_any_blocks_to_local(blocks_global, global_to_local, label="blocks"):
     return blocks_local
 
 
+### Validate block indices
 def check_block_indices(blocks, n_nodes, lookback, n_features, label="blocks"):
     """
     Validate blocks in ORIGINAL flat-index schema:
@@ -1946,6 +1955,7 @@ def check_block_indices(blocks, n_nodes, lookback, n_features, label="blocks"):
         print(f"[WARN:{label}] {bad}/{max(total_flat,1)} issues found while checking block indices.")
 
 
+### Summarize how much a reconstructed tensor changed
 def summarize_tensor_change(x_a, x_b, name_a="A", name_b="B"):
     """
     Quick numeric diagnostic for reconstructed tensors.
@@ -1966,8 +1976,8 @@ def summarize_tensor_change(x_a, x_b, name_a="A", name_b="B"):
           f"sum={d.sum():.6f}  mean={d.mean():.6f}  max={d.max():.6f}")
 
 
-# ── Sensitivity diagnostic on FULL graph ──────────────────────
-# This confirms the trained model itself is responsive to the target node.
+### Sensitivity diagnostic on FULL graph
+#### This confirms the trained model itself is responsive to the target node.
 model.eval()
 _ti = test_indices[0]
 _t0, _t1 = _ti + 1, _ti + LOOKBACK + 1
@@ -1986,7 +1996,7 @@ print(f"  Δ = {abs(_p_bg - _p_orig):.6f}  "
 del _ti, _t0, _t1, _x_orig, _x_bg, _p_orig, _p_bg
 
 
-# ── Extract local subgraph once ───────────────────────────────
+### Extract local subgraph once
 sub_nodes_g, edge_index_sub_g, target_sub_idx_g = extract_upstream_subgraph(
     edge_index      = edge_index,
     target_node_idx = target_node_idx_g,
@@ -2006,11 +2016,11 @@ print(f"  Upstream COMIDs: {up_comids}")
 print(f"  Global target idx : {target_node_idx_g}")
 print(f"  Local  target idx : {target_sub_idx_g}")
 
-# Build local [T, N_sub, F] tensor for all block-based Graph-SHAP
+### Build local [T, N_sub, F] tensor for all block-based Graph-SHAP
 X_TNF_sub = build_local_subgraph_inputs(X_TNF, sub_nodes_g)
 
-# ── Block-level perturbation check in LOCAL subgraph space ───
-# This tests the exact masking route used by block-based Graph-SHAP.
+### Block-level perturbation check in LOCAL subgraph space
+#### This tests the exact masking route used by block-based Graph-SHAP.
 _feat_blocks_chk_global = make_feature_blocks(target_node_idx_g, LOOKBACK, FEATURES)
 
 print("\n[Debug] first 3 raw feature blocks:")
@@ -2040,10 +2050,10 @@ check_block_indices(
 _ti_chk = test_indices[0]
 _t0_chk, _t1_chk = _ti_chk + 1, _ti_chk + LOOKBACK + 1
 
-# local explained sample: [N_sub, lb, F]
+### local explained sample: [N_sub, lb, F]
 _x_exp_chk = X_TNF_sub[_t0_chk:_t1_chk].transpose(1, 0, 2).astype(np.float32)
 
-# training-period background pool built in LOCAL subgraph space
+### training-period background pool built in LOCAL subgraph space
 _bg_pool_chk, _ = build_background_pool(
     X_TNF_sub,
     train_indices,
@@ -2110,18 +2120,16 @@ del (
 )
 
 
-# ──────────────────────────────────────────────────────────────
-# Main Graph-SHAP loop
-# NOTE:
-#   L1/L2/L3 are now all run in LOCAL subgraph space.
-#   Structural Graph-SHAP remains on the FULL graph.
-# ──────────────────────────────────────────────────────────────
+### Main Graph-SHAP loop
+#### NOTE:
+####   L1/L2/L3 are now all run in LOCAL subgraph space.
+####   Structural Graph-SHAP remains on the FULL graph.
 for tgt_out, tgt_name in [(0, "Q"), (1, "Temp")]:
     print(f"\n{'─'*60}")
     print(f"  {tgt_name}  at  COMID {TARGET_COMID_FOR_PLOTS}")
     print(f"{'─'*60}")
 
-    # ── Level 1: Feature blocks at target node ───────────────
+    ### Level 1: Feature blocks at target node
     print("\n[L1] Feature blocks (MC Shapley, LOCAL subgraph) …")
     feat_blocks_global = make_feature_blocks(target_node_idx_g, LOOKBACK, FEATURES)
     feat_blocks_local = remap_any_blocks_to_local(
@@ -2175,7 +2183,7 @@ for tgt_out, tgt_name in [(0, "Q"), (1, "Temp")]:
     np.save(os.path.join(SAVE_DIR, f"graphshap_L1_feat_{tgt_name}_mean.npy"), sv_f_mean)
     np.save(os.path.join(SAVE_DIR, f"graphshap_L1_feat_{tgt_name}_ci95.npy"), sv_f_ci)
 
-    # ── Level 2: Lag blocks ──────────────────────────────────
+    ### Level 2: Lag blocks
     print("\n[L2] Lag blocks (MC Shapley, LOCAL subgraph) …")
     lag_blocks_global = make_lag_blocks(target_node_idx_g, LOOKBACK, FEATURES)
     lag_blocks_local = remap_any_blocks_to_local(
@@ -2225,7 +2233,7 @@ for tgt_out, tgt_name in [(0, "Q"), (1, "Temp")]:
     np.save(os.path.join(SAVE_DIR, f"graphshap_L2_lags_{tgt_name}_mean.npy"), sv_l_mean)
     np.save(os.path.join(SAVE_DIR, f"graphshap_L2_lags_{tgt_name}_ci95.npy"), sv_l_ci)
 
-    # ── Level 3: Node × Feature heatmap ─────────────────────
+    ### Level 3: Node × Feature heatmap
     n_nf = n_sub * len(FEATURES)
     if n_nf <= GRAPHSHAP_MAX_NF_PLAYERS:
         print(f"\n[L3] Node×Feature blocks ({n_nf} players, MC Shapley, LOCAL subgraph) …")
@@ -2298,7 +2306,7 @@ for tgt_out, tgt_name in [(0, "Q"), (1, "Temp")]:
         print(f"\n[L3] Skipped: {n_nf} players exceeds GRAPHSHAP_MAX_NF_PLAYERS={GRAPHSHAP_MAX_NF_PLAYERS}. "
               f"Reduce GRAPHSHAP_N_HOPS or increase the limit.")
 
-    # ── Structural Graph-SHAP on FULL graph ──────────────────
+    ### Structural Graph-SHAP on FULL graph
     print(f"\n[Structural] MC Shapley over incoming edges ({tgt_name}) …")
     sv_e_mean, sv_e_std, sv_e_ci, edge_players = compute_structural_graphshap_mc(
         model=model,

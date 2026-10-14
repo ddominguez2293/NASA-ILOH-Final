@@ -1,32 +1,40 @@
 # Functions_Paths.R
-# Shared paths & helper functions
+# Shared paths & helper functions for the whole pipeline.
+# Sourced at the top of every .Rmd step with: source("SRC/Functions_Paths.R")
+#
+# Comment style used in every script:
+#   ## N. Section   = major section of the script
+#   ### Step        = what the next block of code does
+#   #### Note       = why / assumptions / caveats for that step
+#   # inline        = short single-line bits next to the code
 
-##Packages
+## 1. Packages
+### Load every package the R steps need (quietly)
 suppressPackageStartupMessages({
-  library(sf)
-  library(dplyr)
-  library(purrr)
-  library(nhdplusTools)
-  library(hydroloom)
-  library(dataRetrieval)
-  library(tidyverse)
-  library(arrow)
-  library(slider)
-  library(lubridate)
-  library(zoo)
-  library(DBI)
-  library(duckdb)
+  library(sf)  # spatial vectors, shp / gpkg I/O
+  library(dplyr)  # data wrangling
+  library(purrr)  # map_dfr() over sites
+  library(nhdplusTools)  # NHDPlus HR flowlines / catchments
+  library(hydroloom)  # network / upstream tracing
+  library(dataRetrieval)  # USGS NWIS queries (Q and T)
+  library(tidyverse)  # tidyr, ggplot2, readr, ...
+  library(arrow)  # read / write parquet
+  library(slider)  # rolling-window helpers
+  library(lubridate)  # date handling
+  library(zoo)  # time-series helpers
+  library(DBI)  # database interface
+  library(duckdb)  # SQL on parquet (PET.Rmd)
 })
 
-## Paths
-### Assumes your working directory is set to the repo root
-base_dir <- getwd()
+## 2. Paths
+### Assumes your working directory is the repo root
+base_dir <- getwd()  # project root
 
-data_dir          <- file.path(base_dir, "data")
-shape_dir         <- file.path(data_dir, "shapes")
-nhd_dir           <- file.path(data_dir, "nhdplus")
-meteo_dir         <- file.path(data_dir, "meteo")
-daily_drivers_dir <- file.path(data_dir, "daily_drivers")
+data_dir          <- file.path(base_dir, "data")  # all data lives under data/
+shape_dir         <- file.path(data_dir, "shapes")  # Boundaries.py outputs + basin gpkg
+nhd_dir           <- file.path(data_dir, "nhdplus")  # NHDPlus flowlines / catchments
+meteo_dir         <- file.path(data_dir, "meteo")  # GridMET extractions
+daily_drivers_dir <- file.path(data_dir, "daily_drivers")  # parquet tables passed between steps
 
 ### If directory doesn't exist it will create it otherwise move on
 ensure_dir <- function(path) {
@@ -52,15 +60,18 @@ catchment_path <- file.path(nhd_dir, "catchments.gpkg")
 basins_path    <- file.path(shape_dir, "site_upstream_basins.gpkg")
 flowlines_path <- file.path(nhd_dir, "flowlines.gpkg")
 
-## Functions
-### Geopackage Overwrite
+## 3. Helper functions
+### Geopackage overwrite
+#### Deletes the old file first so st_write() never appends to a stale layer
 write_gpkg_overwrite <- function(obj, path) {
   if (file.exists(path)) file.remove(path)
   st_write(obj, path, quiet = TRUE)
   invisible(path)
 }
 
-### Extract Basins from nhdplus
+### Extract an NLDI basin for one COMID (get_basin_safe)
+#### Returns NULL instead of an error when the lookup fails
+#### Not used by the current pipeline (upstream basins are built locally in Catchments.Rmd); kept as a utility
 get_basin_safe <- purrr::possibly(
   function(cid) {
     b <- get_nldi_basin(list(featureSource = "comid", featureID = cid))
@@ -81,9 +92,11 @@ clean_date <- function(raw_name) {
   as.Date(raw_name, format = "%Y-%m-%d")
 }
 
-###Loops over years between start_date and end_date so a timeout / failure
-#### in one year doesn't kill the whole multi-decade pull.
-#### Requires: climateR, terra, exactextractr, sf
+### Extract one GridMET variable to polygons (extract_variable)
+#### Loops over years between start_date and end_date so a timeout / failure
+#### in one year doesn't kill the whole multi-decade pull
+#### Args: varname = GridMET variable, polygons = sf layer, out_dir = where <varname>_daily.csv is written, id_col = polygon ID column
+#### Requires: climateR, terra, exactextractr, sf. Used by Meteo.Rmd
 
 extract_variable <- function(varname,
                              polygons,
@@ -191,7 +204,10 @@ extract_variable <- function(varname,
   
   df_long
 }
-# Uses global start_date / end_date defined in the calling script.
+
+### Download daily water temperature for one site (download_temp)
+#### Uses global start_date / end_date defined in the calling script (Temp.Rmd)
+#### Returns NULL on error or empty result so purrr::map_dfr() skips the site
 download_temp <- function(site_id) {
   tryCatch({
     message("Downloading: ", site_id, " from ", start_date, " to ", end_date)

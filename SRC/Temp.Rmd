@@ -12,36 +12,48 @@ STEP 3 of the pipeline (runs AFTER Streamflow.Rmd).
 Purpose
 -------
 Pull daily USGS water temperature (parameter 00010) for every site inside the
-AOI, aggregate to one value per (site, Date), then LEFT JOIN the streamflow
+AOI, aggregate to one value per (site, Date), then FULL JOIN the streamflow
 table produced in Streamflow.Rmd.
+
+Inputs
+------
+`data/shapes/illinois_river_basin.shp` (Boundaries.py) and
+`daily_drivers_dir/q_obs.parquet` (Streamflow.Rmd).
 
 End-state of this file
 ----------------------
 **`q_t`** — one row per (site_no, Date) with `water_temp_C` and `q_m3s`.
 Saved to `daily_drivers_dir/q_t.parquet` for consumption by Catchments.Rmd.
 
+Comment style (inside every chunk): `## N.` section, `###` step, `####` note,
+`#` inline bit. Same convention as every other script in SRC/.
+
 ```{r setup, message=TRUE, warning=TRUE}
+## 1. Setup
 knitr::opts_chunk$set(echo = TRUE)
 
-# Shared paths, packages, helper functions
+### Load shared paths, packages and helper functions
 source("SRC/Functions_Paths.R")
 ```
 
 ```{r load-aoi}
-# Load AOI from Boundaries.py
+## 2. Load the AOI and time window
+### Load AOI from Boundaries.py
 aoi  <- st_read(basin_shp, quiet = TRUE) %>% st_transform(4326)
 bbox <- st_bbox(aoi)
 
-# Illinois River Basin bbox fallback (HUC 0712 approximate)
+### Bounding box for the NWIS metadata query
+#### Hard-coded approximate Illinois bbox (West, South, East, North); the AOI bbox above is not used for the query
 bbox_illinois <- c(-93.5, 36.8, -87.5, 42.0)  # West, South, East, North
 
-# Time window
+### Time window
 start_date <- as.Date("1984-01-01")
 end_date   <- as.Date("2026-04-01")
 ```
 
 ```{r temp-metadata}
-# Water temperature metadata (00010)
+## 3. Water temperature site metadata
+### Find every site with daily water temperature (00010) in the bbox
 meta_temp <- read_waterdata_ts_meta(
   parameter_code = "00010",
   bbox           = bbox_illinois,
@@ -50,6 +62,7 @@ meta_temp <- read_waterdata_ts_meta(
   skipGeometry   = TRUE
 )
 
+### Collapse to one row per site (first / last date, number of series)
 meta_temp_clean <- meta_temp %>%
   filter(!is.na(begin), !is.na(end)) %>%
   mutate(begin = as.Date(begin), end = as.Date(end)) %>%
@@ -62,21 +75,25 @@ meta_temp_clean <- meta_temp %>%
     .groups    = "drop"
   )
 
+### Save the metadata and build the site list
 write.csv(meta_temp_clean, "illinois_water_temp_metadata.csv", row.names = FALSE)
 
 sites_df <- meta_temp_clean %>% distinct(monitoring_location_id)
 ```
 
 ```{r pull-temp}
-# Download water temperature for every site.
-# `download_temp(site_id)` lives in SRC/Functions_Paths.R.
+## 4. Download water temperature
+### Download daily T for every site
+#### download_temp(site_id) lives in SRC/Functions_Paths.R
 all_temp_data <- purrr::map_dfr(sites_df$monitoring_location_id, download_temp)
 ```
 
 ```{r clean-temp}
-# Identify all water temp columns (exclude the *_cd flag columns)
+## 5. Clean and aggregate sensors
+### Identify all water temp columns (exclude the *_cd flag columns)
 temp_cols <- grep("Wtemp$", names(all_temp_data), value = TRUE)
 
+### Pivot sensors long, drop NA, average to one value per site-day
 all_temp_clean <- all_temp_data %>%
   pivot_longer(
     cols      = all_of(temp_cols),
@@ -90,6 +107,8 @@ all_temp_clean <- all_temp_data %>%
     .groups      = "drop"
   )
 
+### Write the cleaned T table
+#### temp_clean_out falls back to daily_drivers_dir/illinois_water_temp_clean.csv if it was not set earlier
 if (!exists("temp_clean_out")) {
   temp_clean_out <- file.path(daily_drivers_dir, "illinois_water_temp_clean.csv")
 }
@@ -97,9 +116,9 @@ write.csv(all_temp_clean, temp_clean_out, row.names = FALSE)
 ```
 
 ```{r normalize-site-key}
-# NWIS stores site numbers as bare site_no. The waterdata API returns
-# monitoring_location_id like "USGS-05576195". Strip the prefix so we can
-# join directly onto q_obs$site_no.
+## 6. Normalize the site key
+### Strip the USGS- prefix so T joins directly onto q_obs$site_no
+#### The waterdata API returns monitoring_location_id like "USGS-05576195"; NWIS stores the bare site_no
 temp_daily <- all_temp_clean %>%
   mutate(
     site_no = gsub("^USGS-", "", monitoring_location_id),
@@ -113,27 +132,33 @@ temp_daily <- all_temp_clean %>%
   ) %>%
   filter(Date >= start_date, Date <= end_date)
 
+### Sanity check: exactly one row per (site_no, Date)
 if (any(duplicated(temp_daily[c("site_no", "Date")]))) {
   stop("temp_daily has duplicate (site_no, Date) rows — fix aggregation.")
 }
 ```
 
 ```{r join-q}
-# Bring in Q measurements from Streamflow.Rmd
+## 7. Join Q and T
+### Bring in Q measurements from Streamflow.Rmd
 q_in  <- file.path(daily_drivers_dir, "q_obs.parquet")
 q_obs <- read_parquet(q_in) %>%
   mutate(Date = as.Date(Date)) %>%
   select(site_no, Date, q_m3s)
 
-# LEFT JOIN: keep every temperature row, add Q where the same site has Q
+### Full join on (site_no, Date)
+#### full_join keeps every row from either table, so Q-only and T-only days are both retained
+#### The pct_rows_with_* summary below shows how much of each variable is present
 q_t <- full_join(q_obs, temp_daily, by = c("site_no", "Date"))
 ```
 
 ```{r save-qt}
-# End-state of this file: T joined with Q
+## 8. Save q_t
+### End-state of this file: T joined with Q
 q_t_out <- file.path(daily_drivers_dir, "q_t.parquet")
 write_parquet(q_t, q_t_out)
 
+### Summary of the joined table
 cat("\nQ+T summary:\n")
 print(q_t %>% summarise(
   n_rows           = n(),

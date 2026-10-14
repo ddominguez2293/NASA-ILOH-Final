@@ -5,9 +5,33 @@ editor_options:
   chunk_output_type: console
 ---
 
+STEP 4 of the pipeline (runs AFTER Temp.Rmd).
+
+Purpose
+-------
+Download NHDPlus HR for HU4 0712 + 0713, snap every USGS Q / T site to a flowline
+COMID, build one upstream basin per catchment, and keep only stream order >= 4.
+
+Inputs
+------
+`data/shapes/illinois_river_basin.shp` (Boundaries.py) and
+`daily_drivers_dir/q_t.parquet` (Temp.Rmd).
+
+End-state of this file
+----------------------
+`flowlines.gpkg` and `catchments.gpkg` (stream order >= 4), `site_upstream_basins.gpkg`,
+`sites_with_comid.csv`, and **`q_t_comid.parquet`** (Q + T with COMID and stream order).
+Consumed by Meteo.Rmd.
+
+Comment style (inside every chunk): `## N.` section, `###` step, `####` note,
+`#` inline bit. Same convention as every other script in SRC/.
+
 ```{r setup}
+## 1. Setup
+### Load shared paths, packages and helper functions
 source("SRC/Functions_Paths.R")
 
+### Packages used in this step (data.table speeds up the upstream routing lookup)
 library(sf)
 library(dplyr)
 library(arrow)
@@ -15,26 +39,31 @@ library(dataRetrieval)
 library(nhdplusTools)
 library(data.table)
 
+### Use planar geometry (s2 off) for the intersections below
 sf::sf_use_s2(FALSE)
 ```
 
 ```{r aoi}
-# AOI from Boundaries.py
+## 2. Load the AOI
+### Read the Boundaries.py basin shapefile, make it valid
 aoi <- st_read(basin_shp, quiet = TRUE) %>%
   st_transform(4326) %>%
   st_make_valid()
 ```
 
 ```{r nhd-hr-download}
-# Illinois basin = HU4 0712 + 0713
+## 3. Download NHDPlus HR
+### Illinois basin = HU4 0712 + 0713
 hu4s        <- c("0712", "0713")
 hr_data_dir <- file.path(nhd_dir, "hr_raw")
 hr_gpkg     <- file.path(nhd_dir, "nhdplushr.gpkg")
 
 dir.create(hr_data_dir, recursive = TRUE, showWarnings = FALSE)
 
+### Download the raw HR geodatabases
 download_nhdplushr(hr_data_dir, hu4s)
 
+### Read the flowline + catchment layers and cache them in one gpkg
 hr <- get_nhdplushr(
   hr_data_dir,
   layers   = c("NHDFlowline", "NHDPlusCatchment"),
@@ -43,7 +72,9 @@ hr <- get_nhdplushr(
 ```
 
 ```{r flowlines-catchments}
-# HR flowlines clipped to AOI, renamed to lowercase to match the rest of the pipeline
+## 4. Flowlines and catchments
+### HR flowlines clipped to the AOI
+#### Columns are renamed to lowercase to match the rest of the pipeline
 flowlines <- hr$NHDFlowline %>%
   st_as_sf() %>%
   st_transform(4326) %>%
@@ -69,6 +100,7 @@ flowlines <- hr$NHDFlowline %>%
          fromnode, tonode, terminalfl, startflag, divergence) %>%
   st_intersection(aoi)
 
+### HR catchments clipped to the AOI (comid = FEATUREID)
 catchments <- hr$NHDPlusCatchment %>%
   st_as_sf(sf_column_name = "geom") %>%
   st_transform(4326) %>%
@@ -80,6 +112,8 @@ catchments <- hr$NHDPlusCatchment %>%
 ```
 
 ```{r orphan-check}
+## 5. Orphan check
+### Flag flowlines missing a from / to node (not routable)
 orphans <- flowlines %>%
   filter(is.na(fromnode) | is.na(tonode)) %>%
   pull(comid)
@@ -94,14 +128,14 @@ if (length(orphans) > 0) {
 
 ```{r load and snap-sites-to-comid}
 
-# Load Q+T
-# Load Q+T
+## 6. Load Q+T and site coordinates
+### Load Q+T from Temp.Rmd
 q_t <- read_parquet(file.path(daily_drivers_dir, "q_t.parquet")) %>%
   mutate(Date = as.Date(Date))
 
 site_ids <- paste0("USGS-", unique(q_t$site_no))
 
-# Batch into groups of 50
+### Batch into groups of 50
 batch_size <- 50
 batches <- split(site_ids, ceiling(seq_along(site_ids) / batch_size))
 
@@ -123,8 +157,8 @@ site_info_raw <- purrr::map(batches, function(batch) {
     )
 })
 
-# Keep only sites within the AOI
-# Build sf points
+### Build sf points from the monitoring-location coordinates
+#### Sites are not clipped to the AOI here; sites that do not snap to an AOI flowline drop out in section 7
 site_coords_all <- bind_rows(site_info_raw) %>%
   filter(!is.na(longitude), !is.na(latitude)) %>%
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
@@ -133,8 +167,10 @@ site_coords_all <- bind_rows(site_info_raw) %>%
 ```
 
 ```{r snap-sites-to-comid}
-# Primary snap: nearest flowline with VAA measures (uses full network so small
-# tributaries don't get misrouted to a mainstem reach).
+## 7. Snap sites to COMID
+### Primary snap: nearest flowline with VAA measures
+#### Uses the full network so small tributaries don't get misrouted to a mainstem reach
+#### NOTE: site_coords is used below but never defined in this file; define it first (e.g. site_coords <- site_coords_all)
 vaa <- get_vaa() %>% select(comid, frommeas, tomeas)
 
 flowlines_idx <- flowlines %>%
@@ -145,7 +181,7 @@ flowlines_idx <- flowlines %>%
     ToMeas   = tomeas
   )
 
-# Snap sites to flowlines
+### Snap sites to flowlines (50 m search radius)
 site_matches <- get_flowline_index(
   flowlines_idx,
   site_coords,
@@ -156,7 +192,7 @@ sites_with_comid_sf <- site_coords %>%
   mutate(comid = as.character(site_matches$COMID)) %>%
   filter(!is.na(comid))
 
-# Compute snap distance from each site to its assigned flowline
+### Compute snap distance from each site to its assigned flowline
 flow_match <- flowlines %>%
   mutate(comid = as.character(comid))
 
@@ -174,7 +210,8 @@ sites_with_comid_sf <- sites_with_comid_sf %>%
 cat("\nSnap distance summary (meters):\n")
 print(summary(sites_with_comid_sf$snap_dist_m))
 
-# Keep only defensible direct matches
+### Keep only defensible direct matches
+#### Sites farther than snap_dist_threshold_m (250 m) from their assigned flowline are dropped
 snap_dist_threshold_m <- 250
 
 sites_with_comid_sf <- sites_with_comid_sf %>%
@@ -182,7 +219,7 @@ sites_with_comid_sf <- sites_with_comid_sf %>%
 
 cat("Sites retained after snap-distance filter:", nrow(sites_with_comid_sf), "\n")
 
-# Optional: inspect excluded sites
+### Optional: inspect excluded sites
 sites_excluded_bad_snap <- site_coords %>%
   left_join(
     sites_with_comid_sf %>%
@@ -194,11 +231,12 @@ sites_excluded_bad_snap <- site_coords %>%
 
 cat("Sites excluded for missing/poor COMID match:", nrow(sites_excluded_bad_snap), "\n")
 
-# Final lookup used downstream
+### Final site_no -> comid lookup used downstream
 sites_with_comid <- sites_with_comid_sf %>%
   st_drop_geometry() %>%
   select(site_no, comid)
 
+### Save the lookup to data/shapes/sites_with_comid.csv
 write.csv(
   sites_with_comid,
   file.path(shape_dir, "sites_with_comid.csv"),
@@ -208,6 +246,9 @@ write.csv(
 
 ```{r build-upstream-basins, message=TRUE, warning=TRUE}
 
+## 8. Build upstream basins locally
+### Read the slim flowline routing table and the catchments
+#### NOTE: flowlines.gpkg / catchments.gpkg are read from disk here but (re)written in section 13, so they must exist from an earlier pass
 flowlines <- st_read(flowlines_path, quiet = TRUE) %>%
   st_drop_geometry() %>%
   transmute(
@@ -224,12 +265,8 @@ catchments <- st_read(catchment_path, quiet = TRUE) %>%
 cat("Flowline COMIDs:", n_distinct(flowlines$comid), "\n")
 cat("Catchment COMIDs:", n_distinct(catchments$comid), "\n")
 
-# ----------------------------
-# Target COMIDs
-#
-# This version builds one upstream basin for every catchment COMID.
-# For testing, uncomment slice_head(n = 100), then remove it for the full run.
-# ----------------------------
+### Target COMIDs: one upstream basin per catchment COMID
+#### For testing, uncomment slice_head(n = 100) below, then remove it for the full run
 
 target_comids <- catchments %>%
   st_drop_geometry() %>%
@@ -240,15 +277,9 @@ target_comids <- catchments %>%
 
 cat("Target COMIDs to delineate:", nrow(target_comids), "\n")
 
-# ----------------------------
-# Build upstream routing lookup
-#
-# In the routed network:
-#   upstream reach tonode == downstream reach fromnode
-#
-# So for a target COMID, immediate upstream reaches are those where:
-#   upstream.tonode == target.fromnode
-# ----------------------------
+### Build the upstream routing lookup
+#### In the routed network: upstream reach tonode == downstream reach fromnode
+#### So the immediate upstream reaches of a target COMID are those where upstream.tonode == target.fromnode
 
 flow_dt <- as.data.table(flowlines)
 
@@ -260,6 +291,7 @@ upstream_by_node <- split(reach_nodes$comid, reach_nodes$tonode)
 # For each COMID, what is its upstream node?
 fromnode_by_comid <- setNames(reach_nodes$fromnode, reach_nodes$comid)
 
+### Breadth-first walk upstream: returns the COMID plus every COMID upstream of it
 get_upstream_comids <- function(target_comid) {
   target_comid <- as.character(target_comid)
 
@@ -291,9 +323,8 @@ get_upstream_comids <- function(target_comid) {
   visited
 }
 
-# ----------------------------
-# Build one basin polygon per target COMID
-# ----------------------------
+### Build one basin polygon per target COMID
+#### Each basin is the union of the catchment itself and all catchments upstream of it
 
 basin_list <- vector("list", nrow(target_comids))
 
@@ -341,9 +372,7 @@ if (nrow(basins) == 0) {
   stop("No local upstream basins were created.")
 }
 
-# ----------------------------
-# Write output
-# ----------------------------
+### Write output to site_upstream_basins.gpkg
 
 write_gpkg_overwrite(basins, basins_path)
 
@@ -351,9 +380,7 @@ cat("Wrote local upstream basins to:", basins_path, "\n")
 cat("Basin COMIDs written:", n_distinct(basins$comid), "\n")
 cat("Total basin rows:", nrow(basins), "\n")
 
-# ----------------------------
-# Diagnostics
-# ----------------------------
+### Diagnostics: how many upstream catchments per basin
 
 basins %>%
   st_drop_geometry() %>%
@@ -368,7 +395,8 @@ basins %>%
 ```
 
 ```{r}
-# Sanity Check to make sure basins and catchments match
+## 9. Sanity check: basins vs catchments
+### Every catchment COMID should have an upstream basin
 
 catchments <- st_read(catchment_path, quiet = TRUE) %>%
   st_drop_geometry() %>%
@@ -390,6 +418,8 @@ head(missing_basin_comids, 20)
 ```
 
 ```{r}
+## 10. Sanity check: flowlines vs catchments
+### Count COMIDs in each table and list flowlines without catchments
 catchments %>% summarise(n_catchment_comids = n_distinct(comid))
 
 flowlines <- st_read(flowlines_path, quiet = TRUE) %>%
@@ -405,8 +435,9 @@ anti_join(flowlines, catchments, by = "comid") %>%
 
 
 ```{r join-and-filter-so4}
-# Attach stream order onto Q+T via COMID, then filter Q+T and hydro layers
-# to stream order >= 4 in one consistent pass.
+## 11. Attach stream order and filter to >= 4
+### Attach stream order onto Q+T via COMID, then filter Q+T and hydro layers
+#### Everything is cut to stream order >= 4 in one consistent pass
 flow_attrs <- flowlines %>%
   st_drop_geometry() %>%
   mutate(comid = as.character(comid)) %>%
@@ -422,7 +453,7 @@ q_t_comid <- q_t %>%
   filter(any(!is.na(q_m3s) | !is.na(water_temp_C))) %>%
   ungroup()
 
-# Unique Q and T sensors by stream order (after SO >= 4 filter)
+### Unique Q and T sensors by stream order (after SO >= 4 filter)
 sensor_counts_by_order <- q_t_comid %>%
   group_by(streamorde) %>%
   summarise(
@@ -435,6 +466,7 @@ sensor_counts_by_order <- q_t_comid %>%
 cat("\nUnique sensors by stream order:\n")
 print(sensor_counts_by_order)
 
+### Apply the same stream-order filter to flowlines and catchments
 flowlines <- flowlines %>% filter(!is.na(streamorde), streamorde >= 4)
 
 keep_comids <- unique(as.character(flowlines$comid))
@@ -444,7 +476,8 @@ catchments  <- catchments %>%
 ```
 
 ```{r}
-# Stream order breakdown of unique Q and T sensors
+## 12. Sensor counts by stream order
+### Stream order breakdown of unique Q and T sensors
 q_sensor_counts <- q_t_comid %>%
   filter(!is.na(streamorde), !is.na(q_m3s)) %>%
   distinct(streamorde, site_no) %>%
@@ -466,18 +499,23 @@ print(sensor_counts_by_order)
 
 
 ```{r write-final-outputs}
+## 13. Write final outputs
+### Output paths
 flowline_out  <- file.path(nhd_dir, "flowlines.gpkg")
 catchment_out <- file.path(nhd_dir, "catchments.gpkg")
 q_t_comid_out <- file.path(daily_drivers_dir, "q_t_comid.parquet")
 
+### Remove old outputs so nothing is appended
 for (f in c(flowline_out, catchment_out, q_t_comid_out)) {
   if (file.exists(f)) file.remove(f)
 }
 
+### Write flowlines, catchments (stream order >= 4) and Q+T+COMID
 st_write(flowlines,  flowline_out,  quiet = TRUE)
 st_write(catchments, catchment_out, quiet = TRUE)
 write_parquet(q_t_comid, q_t_comid_out)
 
+### Final summary
 cat("\nFinal Q+T+COMID (stream order >= 4):\n")
 print(q_t_comid %>% summarise(
   n_rows          = n(),
@@ -493,7 +531,8 @@ print(q_t_comid %>% summarise(
 The following is to assess why there are so many stream order 1 sites
 
 ```{r}
-# One row per site with assigned COMID + stream order
+## 14. Diagnostic: why so many stream order 1 sites
+### One row per site with assigned COMID + stream order
 site_stream_order <- q_t %>%
   distinct(site_no) %>%
   left_join(sites_with_comid, by = "site_no") %>%
@@ -502,7 +541,7 @@ site_stream_order <- q_t %>%
   left_join(flow_attrs, by = "comid") %>%
   distinct(site_no, comid, streamorde)
 
-# Quick diagnostic table
+### Quick diagnostic table
 site_stream_order %>%
   count(streamorde, name = "n_sites") %>%
   arrange(streamorde) %>%
@@ -510,8 +549,9 @@ site_stream_order %>%
 ```
 
 ```{r}
-# Rebuild an sf version of sites with stream order attached
-# Sites map, zoomed to AOI
+## 15. Site map
+### Rebuild an sf version of sites with stream order attached
+#### Map is zoomed to the AOI: flowlines in grey, sites in red
 site_points_map <- site_coords %>%
   left_join(site_stream_order, by = "site_no")
 

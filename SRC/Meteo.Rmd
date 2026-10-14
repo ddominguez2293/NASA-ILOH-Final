@@ -5,13 +5,34 @@ editor_options:
   chunk_output_type: console
 ---
 
+STEP 5 of the pipeline (runs AFTER Catchments.Rmd).
+
+Purpose
+-------
+Extract daily GridMET drivers (pr, tmmx, tmmn, srad, vs, vpd, sph, rmin, rmax) for every
+catchment with exactextractr, build basin-scale drivers as the area-weighted mean of the
+upstream catchment values, convert temperatures from K to degC, and join everything.
+
+Inputs
+------
+`flowlines.gpkg`, `catchments.gpkg` and `site_upstream_basins.gpkg` (Catchments.Rmd).
+
+End-state of this file
+----------------------
+**`drivers_daily_joined.parquet`** — one row per (comid, date) with catchment-scale
+and `bsn_*` basin-scale drivers. Consumed by PET.Rmd.
+
+Comment style (inside every chunk): `## N.` section, `###` step, `####` note,
+`#` inline bit. Same convention as every other script in SRC/.
+
 ```{r setup, message=TRUE, warning=TRUE}
+## 1. Setup
 knitr::opts_chunk$set(echo = TRUE)
 
-# Shared paths + helper functions
+### Load shared paths and helper functions
 source("SRC/Functions_Paths.R")
 
-# Packages specific to meteorological extraction
+### Packages specific to meteorological extraction
 library(climateR)
 library(terra)
 library(exactextractr)
@@ -21,7 +42,8 @@ library(data.table)
 ```
 
 ```{r}
-# read in catchments and basins
+## 2. Load catchments and basins
+### Read the catchment and upstream-basin layers from Catchments.Rmd
 catchments <- st_read(catchment_path, quiet = TRUE)
 
 basins <- st_read(basins_path, quiet = TRUE) %>%
@@ -32,11 +54,12 @@ basins <- st_read(basins_path, quiet = TRUE) %>%
 ```
 
 ```{r}
-# set time window of interest
+## 3. Time window, variables, output folders
+### Set the time window of interest
 start_date <- "1984-01-01" #1984-01-01
 end_date   <- "2026-04-01"   # adjust as needed
 
-#set parameters to retrieve
+### GridMET variables to retrieve
 vars <- c("pr",      # precipitation
         "tmmx",    # max temp
           "tmmn",    # min temp
@@ -47,6 +70,7 @@ vars <- c("pr",      # precipitation
           "rmin",    # min relative humidity (%)
           "rmax")     # max relative humidity (%))
 
+### Output folders for catchment-scale and basin-scale files
 meteo_catch_dir <- file.path(meteo_dir, "catchments")
 meteo_basin_dir <- file.path(meteo_dir, "basins")
 
@@ -59,6 +83,9 @@ dir.create(meteo_basin_dir, recursive = TRUE, showWarnings = FALSE)
 
 
 ```{r extract-catchment-vars}
+## 4. Extract catchment-scale GridMET
+### Zonal mean of each variable per catchment per day (exactextractr)
+#### Restart-safe: a variable whose parquet already exists is skipped
 for (v in vars) {
   
   cat("\nExtracting catchment variable:", v, "\n")
@@ -106,7 +133,9 @@ for (v in vars) {
 ```
 
 ```{r extract-basin-vars}
-# This is working but it is taking too long to do this for now. 
+## 5. Extract basin-scale GridMET (disabled)
+### Raster extraction over the upstream basin polygons
+#### Disabled: too slow for ~40k overlapping basins. Basin-scale drivers are computed from catchment values in section 6 instead
 
 # for (v in vars) {
 #   
@@ -155,27 +184,12 @@ for (v in vars) {
 ```
 
 ```{r compute-basin-meteo-from-catchment-meteo, message=TRUE, warning=TRUE}
-# ----------------------------
-# Compute basin-scale meteo from catchment-scale meteo
-#
-# Instead of raster-extracting over 40k overlapping upstream basin polygons,
-# this computes each basin-scale driver as the area-weighted mean of the
-# upstream catchment-scale drivers.
-#
-# Mathematical form:
-#   bsn_var[target_comid, date] =
-#     sum(var[upstream_comid, date] * area_m2[upstream_comid]) /
-#     sum(area_m2[upstream_comid])
-#
-# Inputs:
-#   data/nhdplus/flowlines.gpkg
-#   data/nhdplus/catchments.gpkg
-#   data/meteo/*_daily.parquet
-#
-# Outputs:
-#   data/daily_drivers/basin_members.parquet
-#   data/meteo/basins/bsn_*_daily.parquet
-# ----------------------------
+## 6. Compute basin-scale meteo from catchment-scale meteo
+### Area-weighted mean of the upstream catchment drivers
+#### Instead of raster-extracting over ~40k overlapping upstream basin polygons
+#### bsn_var[target_comid, date] = sum(var[upstream_comid, date] * area_m2[upstream_comid]) / sum(area_m2[upstream_comid])
+#### Inputs: data/nhdplus/flowlines.gpkg, data/nhdplus/catchments.gpkg, data/meteo/catchments/*_daily.parquet
+#### Outputs: data/daily_drivers/basin_members.parquet, data/meteo/basins/bsn_*_daily.parquet
 
 vars <- c("pr", "srad", "vs", "vpd", "sph", "rmin", "rmax", "tmmx", "tmmn")
 
@@ -191,12 +205,8 @@ rebuild_basin_members <- FALSE
 # Set TRUE to overwrite existing bsn_* files.
 overwrite_basin_meteo <- FALSE
 
-# ----------------------------
-# 1) Build upstream membership table
-#
-# Output structure:
-#   target_comid | upstream_comid | area_m2
-# ----------------------------
+### 6.1 Build the upstream membership table
+#### Output structure: target_comid | upstream_comid | area_m2
 
 if (rebuild_basin_members || !file.exists(basin_members_path)) {
 
@@ -330,15 +340,9 @@ if (rebuild_basin_members || !file.exists(basin_members_path)) {
   cat("\nUsing existing basin membership table:", basin_members_path, "\n")
 }
 
-# ----------------------------
-# 2) Compute basin-scale meteo from catchment-scale meteo
-#
-# For each variable:
-#   read catchment meteo file
-#   join to basin_members by upstream_comid
-#   area-weight to target_comid/date
-#   write bsn_* parquet
-# ----------------------------
+### 6.2 Compute basin-scale meteo from catchment-scale meteo
+#### For each variable: read the catchment meteo file, join to basin_members by upstream_comid,
+#### area-weight to target_comid / date, write the bsn_* parquet
 
 cat("\nComputing basin-scale meteo from catchment-scale meteo...\n")
 
@@ -405,9 +409,7 @@ dbDisconnect(con, shutdown = TRUE)
 
 cat("\nFinished computing basin-scale meteo files.\n")
 
-# ----------------------------
-# 3) Final validation
-# ----------------------------
+### 6.3 Final validation
 
 cat("\nValidating key basin meteo files...\n")
 
@@ -456,9 +458,8 @@ cat("\nDone.\n")
 ```
 
 ```{r build-catchment-and-basin-joined-files}
-# -------------------------------
-# Join catchment variable files
-# -------------------------------
+## 7. Join the per-variable files
+### Join catchment variable files
 
 catch_files <- file.path(
   meteo_catch_dir,
@@ -492,9 +493,7 @@ rm(drivers_catchments)
 gc()
 
 
-# -------------------------------
-# Join basin variable files
-# -------------------------------
+### Join basin variable files
 
 basin_files <- file.path(
   meteo_basin_dir,
@@ -530,7 +529,9 @@ gc()
 
 
 ```{r final-join-from-disk}
-# Final catchment + basin join from disk
+## 8. Final catchment + basin join
+### Join from disk with DuckDB and convert K to degC
+#### tmmx / tmmn are in Kelvin; tmax_c, tmin_c, tmean_c (and the bsn_ versions) are in degC
 con <- dbConnect(
   duckdb::duckdb(),
   dbdir = file.path(daily_drivers_dir, "meteo_join.duckdb")
@@ -542,6 +543,7 @@ basin_joined_file_sql <- gsub("\\\\", "/", normalizePath(basin_joined_file))
 drivers_out_file <- file.path(daily_drivers_dir, "drivers_daily_joined.parquet")
 drivers_out_file_sql <- gsub("\\\\", "/", drivers_out_file)
 
+### Build drivers_final: FULL OUTER JOIN of catchment and basin drivers on (comid, date)
 dbExecute(con, paste0("
 CREATE OR REPLACE TABLE drivers_final AS
 SELECT
@@ -577,6 +579,7 @@ FULL OUTER JOIN read_parquet('", basin_joined_file_sql, "') b
 USING (comid, date)
 "))
 
+### Write drivers_daily_joined.parquet (input to PET.Rmd)
 dbExecute(con, paste0("
 COPY drivers_final
 TO '", drivers_out_file_sql, "'
@@ -590,6 +593,8 @@ cat("Saved final joined drivers to:", drivers_out_file, "\n")
 ```
 
 ```{r}
+## 9. Preview
+### Peek at the first rows of the joined drivers
 drivers_final <- arrow::open_dataset(drivers_out_file)
 
 drivers_final %>%
@@ -598,13 +603,16 @@ drivers_final %>%
 ```
 
 ```{r}
-# See what basin meteo files exist
+## 10. Check: basin meteo files
+### See what basin meteo files exist
 list.files(meteo_dir, pattern = "bsn|basins", full.names = FALSE)
 
 list.files(file.path(meteo_dir, "basins"), full.names = FALSE)
 ```
 
 ```{r}
+## 11. Check: coverage of the joined table
+### Share of rows with catchment-scale and / or basin-scale temperature
 library(arrow)
 library(dplyr)
 

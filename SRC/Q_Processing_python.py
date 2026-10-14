@@ -1,41 +1,44 @@
 #!/usr/bin/env python3
 
+# Q_Processing_python.py
+# STEP 7 of the pipeline (runs AFTER PET.Rmd; the model script runs after this).
+#
+# Purpose : join Q / T observations to the PET-enhanced daily drivers, add static
+#           catchment / flowline attributes, and write the model input tables.
+# Inputs  : drivers_daily.parquet        (PET.Rmd)
+#           q_t_comid.parquet            (Catchments.Rmd, Q/T already carry COMID)
+#           flowlines.gpkg, catchments.gpkg (Catchments.Rmd)
+# Outputs : hydro_nodes_allcomids_parquet/nodes.parquet
+#           edge_list.parquet
+#           hydro_temp_data_analysis_pre2013.parquet      (date <  2013-01-01)
+#           hydro_temp_data_trainval_2013plus.parquet     (date >= 2013-01-01, stream order >= 5)
+#
+# Note    : uses q_t_comid.parquet directly; it does NOT rejoin q_t.parquet to sites_with_comid.csv.
+#
+# Comment style used in every script:
+#   ## N. Section   = major section of the script
+#   ### Step        = what the next block of code does
+#   #### Note       = why / assumptions / caveats for that step
+#   # inline        = short single-line bits next to the code
+#
+## 1. Imports
 from pathlib import Path
 import polars as pl
 import geopandas as gpd
 
-# ============================================================
-# Q_Processing_python.py
-#
-# Purpose:
-#   1. Read PET-enhanced all-COMID drivers
-#   2. Read Q/T observations that already have COMID attached
-#   3. Join Q/T to drivers by comid + date
-#   4. Add static catchment / flowline attributes
-#   5. Write:
-#        - hydro_nodes_allcomids_parquet/nodes.parquet
-#        - edge_list.parquet
-#        - hydro_temp_data_analysis_pre2013.parquet
-#        - hydro_temp_data_trainval_2013plus.parquet
-#
-# Important:
-#   This version uses q_t_comid.parquet directly.
-#   It does NOT rejoin q_t.parquet to sites_with_comid.csv.
-# ============================================================
 
 
-# ----------------------------
-# Paths
-# ----------------------------
+## 2. Paths
+### Input and output locations
 
-base_dir = Path("/Users/danieldominguez/Documents/Code/DDNN_ILOH")
+base_dir = Path("/Users/danieldominguez/Documents/Code/DDNN_ILOH")  # NOTE: hard-coded absolute path; change to your project root
 
 daily_drivers_dir = base_dir / "data/daily_drivers"
 
 drivers_parquet = daily_drivers_dir / "drivers_daily.parquet"
 
-# Use this file directly because it already contains:
-# site_no, Date, q_m3s, water_temp_C, comid, streamorde
+### Q/T observations with COMID already attached
+#### q_t_comid.parquet contains: site_no, Date, q_m3s, water_temp_C, comid, streamorde
 qt_comid_parquet = daily_drivers_dir / "q_t_comid.parquet"
 
 flowlines_gpkg = base_dir / "data/nhdplus/flowlines.gpkg"
@@ -50,9 +53,8 @@ out_analysis_parquet = daily_drivers_dir / "hydro_temp_data_analysis_pre2013.par
 out_trainval_parquet = daily_drivers_dir / "hydro_temp_data_trainval_2013plus.parquet"
 
 
-# ----------------------------
-# Required file checks
-# ----------------------------
+## 3. Required file checks
+### Stop early if any input file is missing
 
 required_files = {
     "drivers_parquet": drivers_parquet,
@@ -73,9 +75,8 @@ for label, path in required_files.items():
     print(f"  {label}: {path}")
 
 
-# ----------------------------
-# 0) Build STATICS table
-# ----------------------------
+## 4. Build STATICS table
+### Catchment area (m^2) from catchments.gpkg
 
 catch = gpd.read_file(
     catchments_gpkg,
@@ -95,6 +96,7 @@ catch_pl = (
 
 valid_catchment_comids = catch_pl.select("comid").unique()
 
+### Slope, length and stream order from flowlines.gpkg
 flow = gpd.read_file(
     flowlines_gpkg,
     engine="pyogrio"
@@ -113,8 +115,8 @@ flow_pl = (
     .drop_nulls(["comid"])
 )
 
-# Keep statics only for COMIDs that have catchments.
-# This avoids carrying the ~507 flowline-only COMIDs downstream.
+### Join into one statics table, one row per COMID
+#### Keep statics only for COMIDs that have catchments; this avoids carrying the ~507 flowline-only COMIDs downstream
 statics = (
     flow_pl
     .join(valid_catchment_comids, on="comid", how="inner")
@@ -123,6 +125,7 @@ statics = (
     .join(catch_pl, on="comid", how="left")
 )
 
+### Coverage check
 print("\nSTATICS summary:")
 print(
     statics.select([
@@ -136,9 +139,8 @@ print(
 )
 
 
-# ----------------------------
-# 1) Read PET-enhanced drivers
-# ----------------------------
+## 5. Read PET-enhanced drivers
+### Lazy scan of drivers_daily.parquet
 
 drivers = (
     pl.scan_parquet(str(drivers_parquet))
@@ -149,6 +151,7 @@ drivers = (
     .filter(pl.col("comid").is_not_null())
 )
 
+### Coverage check
 driver_check = drivers.select([
     pl.len().alias("n_rows"),
     pl.col("comid").n_unique().alias("n_comids"),
@@ -162,12 +165,9 @@ print("\nDRIVERS input summary:")
 print(driver_check)
 
 
-# ----------------------------
-# 2) Read Q/T observations with COMID already attached
-#
-# q_t_comid.parquet has:
-#   site_no, Date, q_m3s, water_temp_C, comid, streamorde
-# ----------------------------
+## 6. Read Q/T observations
+### Read Q/T observations with COMID already attached
+#### q_t_comid.parquet has: site_no, Date, q_m3s, water_temp_C, comid, streamorde
 
 qtobs_raw = (
     pl.scan_parquet(str(qt_comid_parquet))
@@ -182,6 +182,7 @@ qtobs_raw = (
     .filter(pl.col("comid").is_not_null())
 )
 
+### Coverage check, overall and by stream order
 qtobs_raw_check = qtobs_raw.select([
     pl.len().alias("n_rows"),
     pl.col("site_no").n_unique().alias("n_sites"),
@@ -212,8 +213,8 @@ print(
     .collect()
 )
 
-# Aggregate to one row per COMID-date.
-# This protects against multiple sites/sensors mapping to the same COMID/date.
+### Aggregate to one row per COMID-date
+#### Protects against multiple sites / sensors mapping to the same COMID and date
 qtobs = (
     qtobs_raw
     .select([
@@ -229,6 +230,7 @@ qtobs = (
     ])
 )
 
+### Coverage check
 qtobs_check = qtobs.select([
     pl.len().alias("n_rows"),
     pl.col("comid").n_unique().alias("n_comids"),
@@ -242,9 +244,8 @@ print("\nQ/T aggregated to COMID-date summary:")
 print(qtobs_check)
 
 
-# ----------------------------
-# 3) Build NODES
-# ----------------------------
+## 7. Build NODES
+### Left-join Q/T obs and statics onto the drivers (one row per comid-date)
 
 nodes = (
     drivers
@@ -253,9 +254,8 @@ nodes = (
 )
 
 
-# ----------------------------
-# 4) Summarize before writing
-# ----------------------------
+## 8. Summarize before writing
+### Row counts, coverage and value ranges of the nodes table
 
 stats = nodes.select([
     pl.len().alias("n_rows"),
@@ -300,9 +300,8 @@ print("\nNODES summary before writing:")
 print(stats)
 
 
-# ----------------------------
-# 5) Q/T availability by stream order before writing
-# ----------------------------
+## 9. Q/T availability by stream order
+### Check before writing
 
 qt_by_stream = (
     nodes
@@ -329,9 +328,8 @@ print("\nNODES Q/T availability by stream order before writing:")
 print(qt_by_stream)
 
 
-# ----------------------------
-# 6) Write nodes parquet
-# ----------------------------
+## 10. Write nodes parquet
+### Stream the lazy frame to zstd parquet
 
 out_nodes_parquet_dir.mkdir(parents=True, exist_ok=True)
 
@@ -343,14 +341,10 @@ nodes.sink_parquet(
 print(f"\nWROTE nodes parquet to: {out_nodes_parquet}")
 
 
-# ----------------------------
-# 7) Build EDGES
-#
-# edge_list.parquet keeps the original format expected by DDNN_Model.py:
-#   comid, fromnode, tonode
-#
-# The model script internally converts fromnode/tonode into COMID-to-COMID edges.
-# ----------------------------
+## 11. Build EDGES
+### Write edge_list.parquet (comid, fromnode, tonode)
+#### Keeps the original format expected by DDNN_Model.py
+#### The model script internally converts fromnode / tonode into COMID-to-COMID edges
 
 edge_df = (
     flow_pl
@@ -375,9 +369,8 @@ print(
 )
 
 
-# ----------------------------
-# 8) Re-read nodes and verify Q/T joined properly
-# ----------------------------
+## 12. Re-read nodes and verify
+### Confirm Q/T joined properly in the written file
 
 nodes_check_lf = pl.scan_parquet(str(out_nodes_parquet))
 
@@ -413,15 +406,13 @@ print("\nRE-READ NODES Q/T CHECK:")
 print(qt_check)
 
 
-# ----------------------------
-# 9) Write modeling split files
-#
-# These replace the old R Watertemp split script.
-# Q/T are already joined in nodes.
-# ----------------------------
+## 13. Write modeling split files
+### Analysis (pre-2013) and train / validation (2013+) tables
+#### These replace the old R Watertemp split script; Q/T are already joined in nodes
+#### The train / validation table is restricted to stream order >= 5
 
-cut_date = pl.date(2013, 1, 1)
-streamorder_min = 5
+cut_date = pl.date(2013, 1, 1)  # split date: before = analysis set, on / after = train / validation set
+streamorder_min = 5  # train / validation set keeps stream order >= 5
 
 analysis_nodes = (
     nodes_check_lf
@@ -448,9 +439,8 @@ print(f"WROTE analysis split to: {out_analysis_parquet}")
 print(f"WROTE train/validation split to: {out_trainval_parquet}")
 
 
-# ----------------------------
-# 10) Split diagnostics
-# ----------------------------
+## 14. Split diagnostics
+### Coverage of the train / validation table
 
 split_stats = trainval_nodes.select([
     pl.len().alias("n_rows"),
@@ -486,6 +476,7 @@ split_stats = trainval_nodes.select([
 print("\nTRAIN/VAL split summary:")
 print(split_stats)
 
+### Q/T availability by stream order
 split_by_stream = (
     trainval_nodes
     .group_by("streamorde")
@@ -511,11 +502,10 @@ print("\nTRAIN/VAL Q/T availability by stream order:")
 print(split_by_stream)
 
 
-# ----------------------------
-# 11) Split diagnostics by model test period
-# ----------------------------
+## 15. Diagnostics by model test period
+### Train / test availability using the model split date
 
-model_split_date = pl.date(2025, 1, 1)
+model_split_date = pl.date(2025, 1, 1)  # same split date used in DDNN_Model.py
 
 model_period_check = (
     trainval_nodes

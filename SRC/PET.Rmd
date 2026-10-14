@@ -6,19 +6,45 @@ editor_options:
   chunk_output_type: console
 ---
 
+STEP 6 of the pipeline (runs AFTER Meteo.Rmd).
+
+Purpose
+-------
+Add extraterrestrial radiation (Ra), Hargreaves PET (catchment-scale `PET` and
+basin-scale `bsn_PET`) and day-of-year sin / cos features to the joined daily
+drivers. The math runs inside DuckDB so the full table never sits in R memory.
+
+Inputs
+------
+`catchments.gpkg` (Catchments.Rmd) and `daily_drivers_dir/drivers_daily_joined.parquet`
+(Meteo.Rmd).
+
+End-state of this file
+----------------------
+**`drivers_daily.parquet`** — one row per (comid, date) with all GridMET drivers,
+Ra, PET, bsn_PET, DOY, DOY_sin, DOY_cos. Consumed by Q_Processing_python.py.
+
+Comment style (inside every chunk): `## N.` section, `###` step, `####` note,
+`#` inline bit. Same convention as every other script in SRC/.
+
 ```{r setup, message=TRUE, warning=TRUE}
+## 1. Setup
 knitr::opts_chunk$set(echo = TRUE)
 
-# Shared paths, packages, and helper functions
+### Load shared paths, packages and helper functions
 source("SRC/Functions_Paths.R")
 ```
 
 ```{r}
+## 2. Catchment latitude lookup
+### Read catchments and take each polygon centroid
+#### Latitude is the only geometry PET needs (it drives Ra)
 catchments <- st_read(catchment_path, quiet = TRUE) %>%
   mutate(comid = as.character(comid))
 
 catchments_centroid <- st_centroid(catchments)
 
+### Build a small comid / lon / lat table
 catchment_lat <- catchments_centroid %>%
   st_coordinates() %>%
   as.data.frame() %>%
@@ -26,20 +52,27 @@ catchment_lat <- catchments_centroid %>%
   mutate(comid = catchments$comid) %>%
   select(comid, lon, lat)
 
-# Keep this small lookup table in memory.
+# keep this small lookup table in memory
 head(catchment_lat)
 ```
 
 ```{r}
+## 3. Compute Ra and PET in DuckDB
+### Set input / output parquet paths
 drivers_in_file <- file.path(daily_drivers_dir, "drivers_daily_joined.parquet")
 drivers_pet_out_file <- file.path(daily_drivers_dir, "drivers_daily.parquet")
 
+### Open an in-memory DuckDB connection
 con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
 
-# Give DuckDB access to the small latitude lookup table.
+### Register the latitude lookup table in DuckDB
 dbWriteTable(con, "catchment_lat", catchment_lat, overwrite = TRUE)
 
-# Join and compute PET inside DuckDB instead of R memory.
+### Join latitude, compute Ra / PET / DOY features and write parquet
+#### Ra = FAO-56 extraterrestrial radiation (mm/day) from latitude and day of year
+#### PET = 0.0023 * (Tmean + 17.8) * sqrt(Tmax - Tmin) * Ra  (Hargreaves)
+#### PET uses catchment temperatures; bsn_PET uses the basin-scale (area-weighted upstream) temperatures
+#### DOY_sin / DOY_cos encode the seasonal cycle for the model
 dbExecute(con, paste0("
 COPY (
   SELECT
@@ -140,13 +173,15 @@ TO '", drivers_pet_out_file, "'
 (FORMAT PARQUET);
 "))
 
+### Close the connection
 dbDisconnect(con, shutdown = TRUE)
 
 cat("Saved PET-enhanced daily drivers to:", drivers_pet_out_file, "\n")
 ```
 
 ```{r}
-# Sanity check to make sure calculations were made 
+## 4. Sanity check
+### Make sure the calculations were made (share of non-missing values per column)
 
 drivers_pet <- arrow::read_parquet(file.path(daily_drivers_dir, "drivers_daily.parquet"))
 

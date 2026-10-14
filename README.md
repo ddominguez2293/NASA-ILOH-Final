@@ -10,16 +10,29 @@ The scripts in `SRC/` form a single pipeline. Run them in the order below, from 
 
 | Step | Script | What it does | Main outputs |
 |------|--------|--------------|--------------|
-| 1 | `Boundaries.py` | Downloads the Ohio River Basin (HUC2 `05`) and Illinois River Basin (HUC4 `0712`) boundaries with `pynhd` and merges them. The Illinois basin is the area of interest used by the R steps. | `data/shapes/*.shp` |
+| 1 | `Boundaries.py` | Downloads the Ohio River Basin (HUC2 `05`) and Illinois River Basin (HUC4 `0712` + `0713`, dissolved into one polygon) boundaries with `pynhd`. The Illinois basin is the area of interest used by every R step. | `data/shapes/*.shp` |
 | 2 | `Streamflow.Rmd` | Pulls daily USGS streamflow (parameter `00060`) for every site in the area of interest and converts it to m³/s. | `q_obs.parquet` |
 | 3 | `Temp.Rmd` | Pulls daily USGS water temperature (parameter `00010`), aggregates to one value per site and date, and joins it to the streamflow table. | `q_t.parquet` |
-| 4 | `Catchments.Rmd` | Builds the hydrologic geospatial layer: NHDPlus flowlines and catchments, upstream basins, and the Q/T site records matched to NHDPlus COMIDs. | `flowlines.gpkg`, `catchments.gpkg`, `site_upstream_basins.gpkg`, `q_t_comid.parquet` |
-| 5 | `Meteo.Rmd` | Downloads daily GridMET drivers (`pr`, `tmmx`, `tmmn`, `srad`, `vs`, `vpd`, `sph`, `rmin`, `rmax`) and aggregates them to each catchment and to its upstream basin with polygon-weighted extraction (`exactextractr`). | `drivers_daily_joined.parquet` |
+| 4 | `Catchments.Rmd` | Downloads NHDPlus HR (HU4 `0712` + `0713`), snaps every Q/T site to a flowline COMID, builds one upstream basin per catchment locally, and keeps stream order ≥ 4. | `flowlines.gpkg`, `catchments.gpkg`, `site_upstream_basins.gpkg`, `sites_with_comid.csv`, `q_t_comid.parquet` |
+| 5 | `Meteo.Rmd` | Downloads daily GridMET drivers (`pr`, `tmmx`, `tmmn`, `srad`, `vs`, `vpd`, `sph`, `rmin`, `rmax`) and extracts them to each catchment with `exactextractr`. Basin-scale drivers are the area-weighted mean of the upstream catchment values. Temperatures are converted from K to °C. | `drivers_daily_joined.parquet` |
 | 6 | `PET.Rmd` | Computes extraterrestrial radiation and Hargreaves potential evapotranspiration at catchment and basin scale (`PET`, `bsn_PET`), and adds day-of-year sine/cosine terms. | `drivers_daily.parquet` |
-| 7 | `Q_Processing_python.py` | Joins the Q/T observations to the drivers by `comid` and `date`, attaches static catchment and flowline attributes (area, slope, length, stream order), builds the routing edge list, and splits the data by date. Uses `polars` so the large tables can be handled. | `nodes.parquet`, `edge_list.parquet`, `hydro_temp_data_analysis_pre2013.parquet`, `hydro_temp_data_trainval_2013plus.parquet` |
+| 7 | `Q_Processing_python.py` | Joins the Q/T observations to the drivers by `comid` and `date`, attaches static catchment and flowline attributes (area, slope, length, stream order), builds the routing edge list, and splits the data by date (pre-2013 analysis set; 2013+ train/validation set restricted to stream order ≥ 5). Uses `polars` so the large tables can be handled. | `nodes.parquet`, `edge_list.parquet`, `hydro_temp_data_analysis_pre2013.parquet`, `hydro_temp_data_trainval_2013plus.parquet` |
 | 8 | `DDNN_Model.py` | **The model.** Trains and evaluates the multitask graph model (see below). | model weights, feature/target scalers, metrics, plots, Graph-SHAP explanations |
 
 `Functions_Paths.R` is not a pipeline step. It centralizes the directory layout, loads the R package stack, and defines the helper functions shared by the R scripts (each one starts with `source("SRC/Functions_Paths.R")`).
+
+## Comment style
+
+Every script in `SRC/` is commented the same way, so the code reads like a markdown outline:
+
+| Marker | Meaning |
+|--------|---------|
+| `## N. Section` | A major section of the script (numbered in order) |
+| `### Step` | What the next block of code does |
+| `#### Note` | Why, assumptions, or caveats for that step |
+| `# inline` | A short single-line bit next to the code |
+
+Inside the R Markdown files these markers sit inside the code chunks, and each file opens with a short prose header (step number, purpose, inputs, end-state). `Python` and `R` scripts open with a header comment listing inputs and outputs. Only comments follow this convention; the code is not affected.
 
 ## Model (`DDNN_Model.py`)
 
@@ -32,7 +45,7 @@ A multitask Graph LSTM–GAT model that predicts discharge (`q_m3s_obs`) and wat
 - **Loss:** a weighted NSE-based term for Q (weight 0.7) plus a masked MSE term for T (weight 0.3), so missing temperature observations do not contribute to the loss. A graph-smoothness penalty and high-flow upweighting are also available in the configuration.
 - **Outputs:** the trained weights and fitted scalers are written to `SAVE_DIR`; metrics (NSE, RMSE, MAE) and diagnostic plots to `OUTPUTS_DIR`. The script also runs a Graph-SHAP analysis at the feature, temporal, node × feature, and structural levels.
 
-All hyperparameters (lookback, hidden sizes, epochs, learning rate, loss weights, and so on) are set in the `CONFIGURATION` block at the top of the script.
+All hyperparameters (lookback, hidden sizes, epochs, learning rate, loss weights, and so on) are set in section `2. Configuration` at the top of the script.
 
 ## Setup notes
 
