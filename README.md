@@ -17,7 +17,8 @@ The scripts in `SRC/` form a single pipeline. Run them in the order below, from 
 | 5 | `Meteo.Rmd` | Downloads daily GridMET drivers (`pr`, `tmmx`, `tmmn`, `srad`, `vs`, `vpd`, `sph`, `rmin`, `rmax`) and extracts them to each catchment with `exactextractr`. Basin-scale drivers are the area-weighted mean of the upstream catchment values. Temperatures are converted from K to °C. | `drivers_daily_joined.parquet` |
 | 6 | `PET.Rmd` | Computes extraterrestrial radiation and Hargreaves potential evapotranspiration at catchment and basin scale (`PET`, `bsn_PET`), and adds day-of-year sine/cosine terms. | `drivers_daily.parquet` |
 | 7 | `Q_Processing_python.py` | Joins the Q/T observations to the drivers by `comid` and `date`, attaches static catchment and flowline attributes (area, slope, length, stream order), builds the routing edge list, and splits the data by date (pre-2013 analysis set; 2013+ train/validation set restricted to stream order ≥ 5). Uses `polars` so the large tables can be handled. | `nodes.parquet`, `edge_list.parquet`, `hydro_temp_data_analysis_pre2013.parquet`, `hydro_temp_data_trainval_2013plus.parquet` |
-| 8 | `DDNN_Model.py` | **The model.** Trains and evaluates the multitask graph model (see below). | model weights, feature/target scalers, metrics, plots, Graph-SHAP explanations |
+| 8 | `DDNN_Model.py` | **The model.** Trains and evaluates the multitask graph model (see below). Run from the terminal with CLI flags so repeat experiments don't require editing the file. | per-run folder under `outputs/`: `results.txt` (test variables + final metrics), `test_metrics_by_streamorder.csv`, diagnostic plots; model weights/scalers/features are only written to `SAVE_DIR` if `--save-model` is passed |
+| 9 | `GraphSHAP.py` | Explains a trained model with Graph-SHAP (feature, temporal, node×feature, and structural levels). Reloads the weights/scalers/features saved by `DDNN_Model.py --save-model` rather than training anything itself — run it once you've settled on a config and want to interpret that model. | Graph-SHAP figures and `.npy` arrays in `OUTPUTS_DIR` / `SAVE_DIR` |
 
 `Functions_Paths.R` is not a pipeline step. It centralizes the directory layout, loads the R package stack, and defines the helper functions shared by the R scripts (each one starts with `source("SRC/Functions_Paths.R")`).
 
@@ -39,19 +40,48 @@ Inside the R Markdown files these markers sit inside the code chunks, and each f
 A multitask Graph LSTM–GAT model that predicts discharge (`q_m3s_obs`) and water temperature (`water_temp_C`) together for every reach in the network.
 
 - **Inputs:** `hydro_temp_data_trainval_2013plus.parquet` (daily COMID × date records with meteorological drivers, PET, static attributes, and observed Q/T) and `edge_list.parquet` (NHDPlus `fromnode`/`tonode` routing).
-- **Architecture:** a single-layer LSTM reads a 7-day lookback window for each reach; two stacked GAT layers then pass information along the routed river graph; a sigmoid-bounded head outputs Q and T.
-- **Domain:** reaches with stream order ≥ 5.
+- **Architecture:** a single-layer LSTM reads a lookback window for each reach; two stacked GAT layers then pass information along the routed river graph; a sigmoid-bounded head outputs Q and T.
+- **Domain:** reaches with `streamorde` inside an inclusive `[min, max]` band (a range filter, not just a floor — lets specific order bands be isolated for comparison).
 - **Data split:** windows with a target date before 2025-01-01 are used for training, and windows on or after that date are held out for testing. Scalers are fit on the training period only.
 - **Loss:** a weighted NSE-based term for Q (weight 0.7) plus a masked MSE term for T (weight 0.3), so missing temperature observations do not contribute to the loss. A graph-smoothness penalty and high-flow upweighting are also available in the configuration.
-- **Outputs:** the trained weights and fitted scalers are written to `SAVE_DIR`; metrics (NSE, RMSE, MAE) and diagnostic plots to `OUTPUTS_DIR`. The script also runs a Graph-SHAP analysis at the feature, temporal, node × feature, and structural levels.
+- **Log-scaling (experimental):** an off-by-default toggle that log1p-transforms discharge before scaling (and inverts it back at evaluation time) — a tail-compression option to test as its own experiment.
 
-All hyperparameters (lookback, hidden sizes, epochs, learning rate, loss weights, and so on) are set in section `2. Configuration` at the top of the script.
+### Running experiments from the terminal
+
+The variables most worth sweeping are exposed as CLI flags, so repeat experiments don't require editing the file:
+
+```
+python SRC/DDNN_Model.py \
+  --streamorder-min 8 --streamorder-max 9 \
+  --lookback 30 \
+  --epochs 200 \
+  [--log-scale-q] [--save-model] [--target-comid COMID] [--run-name NAME]
+```
+
+- `--streamorder-min` / `--streamorder-max` — the stream-order band (default `8`/`9`).
+- `--lookback` — antecedent days per window (default `30`).
+- `--log-scale-q` — enable the log1p experiment above (default off).
+- `--save-model` — persist trained weights/scalers/`features.pkl` to `SAVE_DIR` (default off, since repeat experiment runs would otherwise just keep overwriting the same files). Pass this once a config is settled on and you want `GraphSHAP.py` to be able to explain that model.
+- `--target-comid` — COMID for the single-reach diagnostic plots; if omitted (or not present in the current stream-order band) the script falls back to an arbitrary in-domain COMID and records a warning.
+- `--run-name` — names the output folder; default is built from the test variables plus a timestamp.
+
+Every run writes to its own `outputs/<run-name>/` folder: `results.txt` (every test variable, written at the start of the run, with final NSE/RMSE/MAE metrics appended once training finishes), `test_metrics_by_streamorder.csv`, and the diagnostic plots. Nothing is overwritten between runs unless you reuse `--run-name`.
+
+All other hyperparameters (hidden sizes, learning rate, loss weights, graph coarsening, and so on) are set in section `2. Configuration` at the top of the script.
+
+## Graph-SHAP (`GraphSHAP.py`)
+
+Explains a trained model with a three-level Monte Carlo Shapley framework (feature, temporal, node×feature) plus structural Graph-SHAP over incoming edges — kept in its own script so training runs aren't slowed down by SHAP's permutation sampling.
+
+- **Inputs:** the same node/edge parquet files as `DDNN_Model.py`, plus the trained weights, `scaler_X.pkl`, and `features.pkl` written to `SAVE_DIR` by a `DDNN_Model.py --save-model` run.
+- **Important:** the stream-order band, `LOOKBACK`, graph-coarsening settings, and model hyperparameters at the top of `GraphSHAP.py` are duplicated from `DDNN_Model.py` rather than imported, and must match whichever training run produced the artifacts in `SAVE_DIR` — update them by hand before running.
+- **Outputs:** ranked Shapley bar charts, a node×feature heatmap, and `.npy` arrays, written to `OUTPUTS_DIR` / `SAVE_DIR`.
 
 ## Setup notes
 
 - **Working directory:** the R scripts treat the current working directory as the project root, so run them from the repository root.
-- **Paths:** `Q_Processing_python.py` and `DDNN_Model.py` define their input and output locations near the top of the file (`base_dir`, `NODES_PATH`, `EDGES_PATH`, `SAVE_DIR`, `OUTPUTS_DIR`). Update these to match your machine before running.
-- **Python:** `geopandas`, `pynhd`, `polars`, `pandas`, `numpy`, `scikit-learn`, `joblib`, `matplotlib`, `shap`, `torch`, and `torch_geometric`.
+- **Paths:** `Q_Processing_python.py`, `DDNN_Model.py`, and `GraphSHAP.py` all resolve their input/output paths (`NODES_PATH`, `EDGES_PATH`, `SAVE_DIR`, `OUTPUTS_DIR`) relative to the repository root automatically — no hand-editing needed on a different machine.
+- **Python:** `pip install -r requirements.txt` (pinned versions in `requirements-lock.txt`) installs `numpy`, `pandas`, `matplotlib`, `joblib`, `scikit-learn`, `torch`, `torch-geometric`, `shap`, `pyarrow`, and the rest of the pipeline's dependencies, plus `geopandas`/`pynhd`/`polars` for the earlier steps.
 - **R:** the package stack loaded in `Functions_Paths.R`, plus `climateR`, `terra`, `exactextractr`, and `data.table` for the meteorological step.
 - **Data:** everything under `data/` is generated by the pipeline and is excluded from version control.
 

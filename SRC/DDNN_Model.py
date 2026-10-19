@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # DDNN_Model.py  (the model file)
-# STEP 8 of the pipeline (last script; runs AFTER Q_Processing_python.py).
+# STEP 8 of the pipeline (runs AFTER Q_Processing_python.py; GraphSHAP.py runs after this).
 #
 # Purpose : train and evaluate a multitask Graph LSTM-GAT that predicts daily discharge (Q)
-#           and water temperature (T) on the routed NHDPlus network, then explain it with
-#           Graph-SHAP (feature, lag, node x feature and structural levels).
+#           and water temperature (T) on the routed NHDPlus network. Run from the terminal
+#           with CLI flags (see Section 2) so repeat experiments don't require editing this
+#           file. Graph-SHAP interpretation lives in GraphSHAP.py, run separately afterward.
 # Inputs  : hydro_temp_data_trainval_2013plus.parquet   (NODES_PATH)
 #           edge_list.parquet                           (EDGES_PATH)
-# Outputs : trained model weights, scalers and features.pkl in SAVE_DIR;
-#           diagnostic figures and Graph-SHAP results in OUTPUTS_DIR
+# Outputs : outputs/<RUN_NAME>/results.txt (test variables + final metrics),
+#           test_metrics_by_streamorder.csv, and diagnostic figures — one
+#           folder per run. Trained weights/scalers/features.pkl are only
+#           written to SAVE_DIR when --save-model is passed.
 #
 # Note    : the study area is the Illinois River Basin, HUC4 0712 + 0713 (the module docstring
 #           below mentions 0712 only).
@@ -33,7 +36,9 @@ Explanation  : Full Graph-SHAP — feature, temporal, node×feature, and structu
 ## 1. Imports
 ### Standard library
 import os
+import argparse
 from pathlib import Path
+from datetime import datetime
 
 ### Scientific stack
 import numpy as np
@@ -55,6 +60,30 @@ from sklearn.preprocessing import MinMaxScaler
 
 ## 2. Configuration
 
+### Command-line experiment overrides
+#### Lets repeat experiments be launched from the terminal without editing
+#### this file each run, e.g.:
+####   python SRC/DDNN_Model.py --streamorder-min 8 --streamorder-max 9 --lookback 30
+#### Defaults below match the current first verification run.
+parser = argparse.ArgumentParser(description="Train the Graph LSTM-GAT multitask Q/T model.")
+parser.add_argument("--streamorder-min", type=int, default=8)
+parser.add_argument("--streamorder-max", type=int, default=9)
+parser.add_argument("--lookback", type=int, default=30, help="days of antecedent input per window")
+parser.add_argument("--epochs", type=int, default=200)
+parser.add_argument("--log-scale-q", action="store_true", default=False,
+                     help="log1p-transform discharge before scaling (off by default)")
+parser.add_argument("--save-model", action="store_true", default=False,
+                     help="persist trained weights/scalers/features to SAVE_DIR "
+                          "(off by default while running experiments)")
+parser.add_argument("--run-name", type=str, default=None,
+                     help="outputs/<run-name> folder name; default is built from "
+                          "the test variables + a timestamp")
+parser.add_argument("--target-comid", type=int, default=None,
+                     help="COMID for single-reach diagnostic plots; defaults to 14787569, "
+                          "falling back to an in-domain COMID if that one isn't in this "
+                          "run's stream-order band")
+args = parser.parse_args()
+
 ### Input data paths
 #### Node table: daily COMID×date records with met drivers, discharge, and temperature.
 #### Edge table: NHDPlus fromnode/tonode routing used to build the directed graph.
@@ -67,10 +96,10 @@ EDGES_PATH = PROJECT_ROOT / "data" / "daily_drivers" / "edge_list.parquet"
 ### Temporal split & sequence
 #### Temporal split: all windows whose target date falls before SPLIT_DATE go to
 #### training; windows on or after go to the held-out test set. LOOKBACK sets how
-#### many antecedent days feed each window; 30 days is this run's test of longer
-#### memory (first verification run, paired with STREAMORDER_MIN/MAX = 8/9 below).
+#### many antecedent days feed each window; both LOOKBACK and the stream order
+#### band below come from --lookback / --streamorder-min / --streamorder-max.
 SPLIT_DATE   = pd.Timestamp("2025-01-01")
-LOOKBACK     = 30                           # days of antecedent input per window
+LOOKBACK     = args.lookback                # days of antecedent input per window
 
 ### Model hyperparameters
 #### Compact single-layer LSTM captures short-term temporal dynamics at each reach;
@@ -85,7 +114,7 @@ GNN_DROPOUT  = 0.2
 GAT_HEADS    = 4                            # multi-head attention in each GAT layer
 
 ### Training schedule
-EPOCHS       = 200
+EPOCHS       = args.epochs
 LR           = 1e-4
 BATCH_SIZE   = 1                            # one full graph window per step
 PATIENCE     = 10                           # early-stopping patience (epochs)
@@ -94,8 +123,8 @@ PATIENCE     = 10                           # early-stopping patience (epochs)
 #### Stream order range filter (inclusive on both ends), replacing the old
 #### single min-only threshold so specific order bands can be tested in
 #### isolation. First verification run targets orders 8-9 only.
-STREAMORDER_MIN = 8
-STREAMORDER_MAX = 9
+STREAMORDER_MIN = args.streamorder_min
+STREAMORDER_MAX = args.streamorder_max
 
 ### Feature groups
 #### Meteorological drivers from GridMET: precipitation, radiation, wind, vapor
@@ -141,7 +170,7 @@ Q_HIGH_POWER      = 1.0
 #### scaler_y is fit, and inverted (expm1) after inverse_transform at eval
 #### time — see Section 6 and Section 12. Off by default; this is its own
 #### experiment to run, not part of the first stream-order/lookback test.
-USE_LOG_SCALE_Q = False
+USE_LOG_SCALE_Q = args.log_scale_q
 
 ### Graph smoothness regularization
 #### Optional L2 penalty on predicted Q differences along directed edges.
@@ -150,10 +179,26 @@ USE_GRAPH_SMOOTHNESS = True
 LAMBDA_SMOOTH        = 1e-3                 # tune between 1e-4 and 1e-2
 
 ### Output paths
-TARGET_COMID_FOR_PLOTS = 14787569           # COMID used for single-reach diagnostics
+TARGET_COMID_FOR_PLOTS = args.target_comid or 14787569  # COMID used for single-reach diagnostics
+
+### Model saving
+#### Off by default while running experiments — repeat runs would otherwise
+#### keep overwriting the same weights/scaler files in SAVE_DIR for no benefit
+#### until a config is actually settled on. Pass --save-model to persist them.
+SAVE_MODEL = args.save_model
+
+### Run tag and per-run output folder
+#### Every run gets its own outputs/<RUN_NAME>/ folder (figures + a written
+#### record of the test variables and final metrics) so repeat experiments
+#### with different settings don't overwrite each other's results.
+RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RUN_NAME = args.run_name or (
+    f"so{STREAMORDER_MIN}-{STREAMORDER_MAX}_lb{LOOKBACK}"
+    f"{'_logQ' if USE_LOG_SCALE_Q else ''}_{RUN_TIMESTAMP}"
+)
 
 SAVE_DIR    = PROJECT_ROOT / "data" / "models"
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+OUTPUTS_DIR = PROJECT_ROOT / "outputs" / RUN_NAME
 FEATURES_PATH       = os.path.join(SAVE_DIR, "features.pkl")
 EDGE_SUSPICIOUS_OUT = os.path.join(SAVE_DIR, "edge_suspicious_checks.csv")
 
@@ -168,6 +213,55 @@ COARSE_MODE         = "nearest"
 MODEL_FILENAME = "graph_lstm_gat_multitask_q_t_maskedloss_sigmoid_head.pth"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+### Record the test variables before anything runs
+#### Written first so a run's config is on disk even if training is
+#### interrupted; final metrics are appended to the same file in Section 12.
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+RESULTS_PATH = os.path.join(OUTPUTS_DIR, "results.txt")
+
+with open(RESULTS_PATH, "w") as f:
+    f.write(f"Run: {RUN_NAME}\n")
+    f.write(f"Timestamp: {RUN_TIMESTAMP}\n\n")
+    f.write("=== Test variables ===\n")
+    for key, val in {
+        "NODES_PATH": NODES_PATH,
+        "EDGES_PATH": EDGES_PATH,
+        "SPLIT_DATE": SPLIT_DATE.date(),
+        "LOOKBACK": LOOKBACK,
+        "STREAMORDER_MIN": STREAMORDER_MIN,
+        "STREAMORDER_MAX": STREAMORDER_MAX,
+        "USE_LOG_SCALE_Q": USE_LOG_SCALE_Q,
+        "H_LSTM": H_LSTM,
+        "LSTM_LAYERS": LSTM_LAYERS,
+        "LSTM_DROPOUT": LSTM_DROPOUT,
+        "H_GNN": H_GNN,
+        "GNN_DROPOUT": GNN_DROPOUT,
+        "GAT_HEADS": GAT_HEADS,
+        "EPOCHS": EPOCHS,
+        "LR": LR,
+        "BATCH_SIZE": BATCH_SIZE,
+        "PATIENCE": PATIENCE,
+        "TASK_WEIGHTS": TASK_WEIGHTS.tolist(),
+        "Q_HIGH_THRESH_M3S": Q_HIGH_THRESH_M3S,
+        "Q_HIGH_MAX_MULT": Q_HIGH_MAX_MULT,
+        "Q_HIGH_POWER": Q_HIGH_POWER,
+        "USE_GRAPH_SMOOTHNESS": USE_GRAPH_SMOOTHNESS,
+        "LAMBDA_SMOOTH": LAMBDA_SMOOTH,
+        "USE_COARSENED_GRAPH": USE_COARSENED_GRAPH,
+        "MAX_HOPS_COARSEN": MAX_HOPS_COARSEN,
+        "COARSE_MODE": COARSE_MODE,
+        "TARGET_COMID_FOR_PLOTS": TARGET_COMID_FOR_PLOTS,
+        "SAVE_MODEL": SAVE_MODEL,
+        "BASE_FEATURES": BASE_FEATURES,
+        "STATIC_FEATURES": STATIC_FEATURES,
+        "SEASONAL_FEATURES": SEASONAL_FEATURES,
+    }.items():
+        f.write(f"{key}: {val}\n")
+
+print(f"\nRun '{RUN_NAME}'")
+print(f"Test variables written to: {RESULTS_PATH}")
+print(f"Outputs for this run: {OUTPUTS_DIR}")
 
 
 ## 3. Utility functions
@@ -502,7 +596,6 @@ print("Remaining stream orders:", sorted(nodes_df_raw["streamorde"].dropna().uni
 #### Order is fixed here and persisted to disk so inference can reproduce the
 #### exact scaler alignment used during training.
 FEATURES = BASE_FEATURES + SEASONAL_FEATURES + STATIC_FEATURES
-os.makedirs(SAVE_DIR, exist_ok=True)
 
 required_cols = {"comid", "date", Q_COL, T_COL, "temp_avail_raw", "q_avail_raw"} | set(FEATURES)
 missing_cols = [c for c in sorted(required_cols) if c not in nodes_df_raw.columns]
@@ -517,9 +610,13 @@ non_numeric = [f for f in FEATURES if not pd.api.types.is_numeric_dtype(nodes_df
 if non_numeric:
     raise TypeError("These FEATURES are not numeric dtypes:\n" + "\n".join(non_numeric))
 
-joblib.dump(FEATURES, FEATURES_PATH)
-print(f"Using explicit FEATURES (n={len(FEATURES)}), saved to: {FEATURES_PATH}")
+print(f"Using explicit FEATURES (n={len(FEATURES)}):")
 print(FEATURES)
+
+if SAVE_MODEL:
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    joblib.dump(FEATURES, FEATURES_PATH)
+    print(f"Saved FEATURES to: {FEATURES_PATH}")
 
 keep_cols = ["comid", "date"] + FEATURES + TARGETS + ["temp_avail_raw", "q_avail_raw"]
 nodes_df = nodes_df_raw[keep_cols].copy()
@@ -1065,7 +1162,7 @@ print("\n=== Test Metrics by Stream Order ===")
 print(metrics_by_streamorder)
 
 metrics_by_streamorder.to_csv(
-    os.path.join(SAVE_DIR, "test_metrics_by_streamorder.csv"),
+    os.path.join(OUTPUTS_DIR, "test_metrics_by_streamorder.csv"),
     index=False
 )
 
@@ -1074,14 +1171,35 @@ print(f"Pred Q < 0 count: {int((pred_q < 0).sum())} / {pred_q.size}")
 print(f"Pred Temp < 0 count: {int((pred_t < 0).sum())} / {pred_t.size}")
 print(f"Pred Temp > 40 count: {int((pred_t > 40).sum())} / {pred_t.size}")
 
+### Append final metrics to this run's results.txt (test variables were
+#### already written at the top of the run, in Section 2).
+with open(RESULTS_PATH, "a") as f:
+    f.write("\n=== Test Metrics (original units; observed-only) ===\n")
+    f.write(f"Q    -> NSE: {q_nse:.4f} | RMSE: {q_rmse:.4f} | MAE: {q_mae:.4f} | n_obs={int(mask_q.sum())}\n")
+    f.write(f"Temp -> NSE: {t_nse:.4f} | RMSE: {t_rmse:.4f} | MAE: {t_mae:.4f} | n_obs={int(mask_t.sum())}\n")
+    f.write("\n=== Test Metrics by Stream Order ===\n")
+    f.write(metrics_by_streamorder.to_string(index=False))
+    f.write("\n")
+
 ## 13. Diagnostic plots
 #### Generates single-COMID hydrographs, observed-vs-predicted scatterplots,
 #### and observed-distribution histograms.  All figures are written directly to
 #### OUTPUTS_DIR so the full script can run uninterrupted without manual figure
 #### closing.  The histogram view applies the same preprocessing rules used
 #### during training so what you inspect matches what the model saw.
+#### The default target COMID may not fall inside every stream-order band
+#### tested here; fall back to an arbitrary in-domain COMID rather than
+#### losing the scatter/histogram plots (which don't depend on the target)
+#### over a single-reach hydrograph that can't be drawn for this domain.
 if TARGET_COMID_FOR_PLOTS not in comid_to_idx:
-    raise ValueError(f"COMID {TARGET_COMID_FOR_PLOTS} not found in dataset.")
+    fallback_comid = int(all_comids[0])
+    print(f"\n[WARNING] COMID {TARGET_COMID_FOR_PLOTS} not in this run's domain "
+          f"(streamorde {STREAMORDER_MIN}-{STREAMORDER_MAX}); "
+          f"falling back to COMID {fallback_comid} for single-reach plots.")
+    with open(RESULTS_PATH, "a") as f:
+        f.write(f"\n[WARNING] TARGET_COMID_FOR_PLOTS {TARGET_COMID_FOR_PLOTS} not in domain; "
+                f"used fallback COMID {fallback_comid} for single-reach plots.\n")
+    TARGET_COMID_FOR_PLOTS = fallback_comid
 
 catch_idx = comid_to_idx[TARGET_COMID_FOR_PLOTS]
 
@@ -1204,16 +1322,20 @@ plot_obs_histograms_logy(
 
 ## 14. Save the model
 #### Model weights, both scalers, and the feature list (order-critical for
-#### inference) are written to SAVE_DIR.  Reloading all three is necessary to
-#### reproduce predictions outside this script.
-os.makedirs(SAVE_DIR, exist_ok=True)
-os.makedirs(OUTPUTS_DIR, exist_ok=True)
-torch.save(model.state_dict(), os.path.join(SAVE_DIR, MODEL_FILENAME))
-joblib.dump(scaler_X, os.path.join(SAVE_DIR, "scaler_X.pkl"))
-joblib.dump(scaler_y, os.path.join(SAVE_DIR, "scaler_y.pkl"))
-joblib.dump(FEATURES, FEATURES_PATH)
+#### inference) are written to SAVE_DIR — but only when --save-model is
+#### passed. While sweeping experiments, results.txt + the plots in
+#### OUTPUTS_DIR are the record; weights are only worth keeping once a
+#### config is settled on and GraphSHAP.py needs them to run.
+if SAVE_MODEL:
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(SAVE_DIR, MODEL_FILENAME))
+    joblib.dump(scaler_X, os.path.join(SAVE_DIR, "scaler_X.pkl"))
+    joblib.dump(scaler_y, os.path.join(SAVE_DIR, "scaler_y.pkl"))
+    joblib.dump(FEATURES, FEATURES_PATH)
+    print(f"\nSaved model/scalers/features to:\n  {SAVE_DIR}\n  model: {MODEL_FILENAME}\n  features: {FEATURES_PATH}")
+else:
+    print("\n--save-model not set: skipping weight/scaler/feature save for this run.")
 
-print(f"\nSaved model/scalers/features to:\n  {SAVE_DIR}\n  model: {MODEL_FILENAME}\n  features: {FEATURES_PATH}")
 print(f"Graph smoothness: {USE_GRAPH_SMOOTHNESS} (lambda={LAMBDA_SMOOTH})")
 print("Output head: sigmoid on BOTH Q and Temp (scaled-space bounded)")
 

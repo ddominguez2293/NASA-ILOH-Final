@@ -56,6 +56,9 @@ rsconnect/
 # Data folder (large, not tracked)
 /data
 
+# Per-run experiment outputs (results.txt, metrics CSVs, plots) — generated, not tracked
+/outputs
+
 # Ignore csv files
 *.csv
 
