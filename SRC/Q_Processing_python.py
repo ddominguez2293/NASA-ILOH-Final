@@ -31,7 +31,8 @@ import geopandas as gpd
 ## 2. Paths
 ### Input and output locations
 
-base_dir = Path("/Users/danieldominguez/Documents/Code/DDNN_ILOH")  # NOTE: hard-coded absolute path; change to your project root
+# Resolve the repository root from this script's location.
+base_dir = Path(__file__).resolve().parents[1]
 
 daily_drivers_dir = base_dir / "data/daily_drivers"
 

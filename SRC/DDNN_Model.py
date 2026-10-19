@@ -33,6 +33,7 @@ Explanation  : Full Graph-SHAP — feature, temporal, node×feature, and structu
 ## 1. Imports
 ### Standard library
 import os
+from pathlib import Path
 
 ### Scientific stack
 import numpy as np
@@ -47,11 +48,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.nn import GATConv
-from torch_geometric.utils import k_hop_subgraph
 
 ### Sklearn
 from sklearn.preprocessing import MinMaxScaler
-import shap  # optional — retained for potential kernel-SHAP comparisons
 
 
 ## 2. Configuration
@@ -59,16 +58,19 @@ import shap  # optional — retained for potential kernel-SHAP comparisons
 ### Input data paths
 #### Node table: daily COMID×date records with met drivers, discharge, and temperature.
 #### Edge table: NHDPlus fromnode/tonode routing used to build the directed graph.
-#### NOTE: NODES_PATH, EDGES_PATH, SAVE_DIR and OUTPUTS_DIR are hard-coded absolute paths; point them at your own project folders
-NODES_PATH = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_trainval_2013plus.parquet"
-EDGES_PATH = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/edge_list.parquet"
+#### Paths are resolved relative to the repository root for portability.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+NODES_PATH = PROJECT_ROOT / "data" / "daily_drivers" / "hydro_temp_data_trainval_2013plus.parquet"
+EDGES_PATH = PROJECT_ROOT / "data" / "daily_drivers" / "edge_list.parquet"
 
 ### Temporal split & sequence
 #### Temporal split: all windows whose target date falls before SPLIT_DATE go to
-#### training; windows on or after go to the held-out test set. A 7-day lookback
-#### gives the model enough recent memory without overextending sequence length.
+#### training; windows on or after go to the held-out test set. LOOKBACK sets how
+#### many antecedent days feed each window; 30 days is this run's test of longer
+#### memory (first verification run, paired with STREAMORDER_MIN/MAX = 8/9 below).
 SPLIT_DATE   = pd.Timestamp("2025-01-01")
-LOOKBACK     = 7                            # days of antecedent input per window
+LOOKBACK     = 30                           # days of antecedent input per window
 
 ### Model hyperparameters
 #### Compact single-layer LSTM captures short-term temporal dynamics at each reach;
@@ -89,9 +91,11 @@ BATCH_SIZE   = 1                            # one full graph window per step
 PATIENCE     = 10                           # early-stopping patience (epochs)
 
 ### Modeling domain
-#### Restricting to stream order ≥4 or 5 focuses the model on larger, better-observed
-#### reaches to pair with remote sensing derived chl-a predictions
-STREAMORDER_MIN = 5
+#### Stream order range filter (inclusive on both ends), replacing the old
+#### single min-only threshold so specific order bands can be tested in
+#### isolation. First verification run targets orders 8-9 only.
+STREAMORDER_MIN = 8
+STREAMORDER_MAX = 9
 
 ### Feature groups
 #### Meteorological drivers from GridMET: precipitation, radiation, wind, vapor
@@ -130,6 +134,15 @@ Q_HIGH_THRESH_M3S = 100.0
 Q_HIGH_MAX_MULT   = 5.0
 Q_HIGH_POWER      = 1.0
 
+### Log scaling training option (experimental)
+#### Jake's suggestion: discharge is heavy right-tailed, so log1p-transforming
+#### Q before MinMax scaling compresses high-flow outliers and may make the
+#### NSE-like loss easier to optimize. Applied to the Q column only, before
+#### scaler_y is fit, and inverted (expm1) after inverse_transform at eval
+#### time — see Section 6 and Section 12. Off by default; this is its own
+#### experiment to run, not part of the first stream-order/lookback test.
+USE_LOG_SCALE_Q = False
+
 ### Graph smoothness regularization
 #### Optional L2 penalty on predicted Q differences along directed edges.
 #### Discourages physically implausible jumps in discharge across connected reaches.
@@ -139,8 +152,8 @@ LAMBDA_SMOOTH        = 1e-3                 # tune between 1e-4 and 1e-2
 ### Output paths
 TARGET_COMID_FOR_PLOTS = 14787569           # COMID used for single-reach diagnostics
 
-SAVE_DIR    = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/models"
-OUTPUTS_DIR = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/outputs"
+SAVE_DIR    = PROJECT_ROOT / "data" / "models"
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 FEATURES_PATH       = os.path.join(SAVE_DIR, "features.pkl")
 EDGE_SUSPICIOUS_OUT = os.path.join(SAVE_DIR, "edge_suspicious_checks.csv")
 
@@ -465,11 +478,11 @@ nodes_df_raw["q_avail_raw"]    = ~nodes_df_raw[Q_COL].isna()
 
 ### Modeling domain: stream order filter
 #### Applied to both train and test to keep the domain consistent.
-#### Restricting to order ≥ STREAMORDER_MIN focuses the model on larger,
-#### better-observed reaches during initial development.
+#### Restricting to STREAMORDER_MIN <= order <= STREAMORDER_MAX isolates a
+#### specific order band for comparison across experiments (e.g. orders 8-9).
 so_filter = pd.to_numeric(nodes_df_raw["streamorde"], errors="coerce")
 
-keep_rows = so_filter >= STREAMORDER_MIN
+keep_rows = (so_filter >= STREAMORDER_MIN) & (so_filter <= STREAMORDER_MAX)
 
 n_before = len(nodes_df_raw)
 nodes_df_raw = nodes_df_raw.loc[keep_rows].copy()
@@ -477,7 +490,7 @@ nodes_df_raw = nodes_df_raw.sort_values(["date", "comid"]).reset_index(drop=True
 n_after = len(nodes_df_raw)
 
 print("\n=== Applied stream order filter ===")
-print(f"Rule: keep streamorde >= {STREAMORDER_MIN}")
+print(f"Rule: keep {STREAMORDER_MIN} <= streamorde <= {STREAMORDER_MAX}")
 print(f"Rows before: {n_before:,}")
 print(f"Rows after : {n_after:,}")
 print(f"Dropped    : {n_before - n_after:,}")
@@ -577,6 +590,15 @@ if edge_index.numel() == 0:
 #### supervision is gated by the pre-computed availability masks so those
 #### filled values never act as true training signal.
 
+### Optional log1p transform of discharge (training option)
+#### Applied to nodes_df in physical units, before scaler_y is fit, so the
+#### scaler operates on the log-compressed distribution. Inverted (expm1)
+#### after scaler_y.inverse_transform in Section 12 so metrics/plots stay
+#### in physical units regardless of this flag.
+if USE_LOG_SCALE_Q:
+    nodes_df[Q_COL] = np.log1p(nodes_df[Q_COL])
+    print(f"\n[LogScale] Applied log1p to {Q_COL} before scaling.")
+
 train_mask_rows = nodes_df["date"] < SPLIT_DATE
 if train_mask_rows.sum() == 0:
     raise ValueError("No training rows found before SPLIT_DATE. Check SPLIT_DATE or data date range.")
@@ -605,7 +627,8 @@ q_idx = TARGETS.index(Q_COL)
 q_min = float(scaler_y.data_min_[q_idx])
 q_max = float(scaler_y.data_max_[q_idx])
 q_range = max(q_max - q_min, 1e-12)
-q_thresh_scaled = float((Q_HIGH_THRESH_M3S - q_min) / q_range)
+q_thresh_phys = np.log1p(Q_HIGH_THRESH_M3S) if USE_LOG_SCALE_Q else Q_HIGH_THRESH_M3S
+q_thresh_scaled = float((q_thresh_phys - q_min) / q_range)
 q_thresh_scaled = float(np.clip(q_thresh_scaled, 0.0, 1.0))
 
 print(f"\nQ weighting setup:")
@@ -948,6 +971,11 @@ def inverse_two_columns(arr_2):
 pred_phys = inverse_two_columns(preds_scaled)
 obs_phys  = inverse_two_columns(obs_scaled)
 
+### Undo the log1p transform (if enabled) so metrics/plots stay in physical units
+if USE_LOG_SCALE_Q:
+    pred_phys[:, :, 0] = np.expm1(pred_phys[:, :, 0])
+    obs_phys[:, :, 0]  = np.expm1(obs_phys[:, :, 0])
+
 pred_phys[:, :, 0] = np.clip(pred_phys[:, :, 0], 0.0, None)
 
 pred_q = pred_phys[:, :, 0].ravel()
@@ -1155,7 +1183,9 @@ nodes_raw = replace_sentinel_with_nan(nodes_raw, [Q_COL, T_COL])
 
 ### Match modeling-domain filter
 nodes_raw["streamorde"] = pd.to_numeric(nodes_raw["streamorde"], errors="coerce")
-nodes_raw = nodes_raw.loc[nodes_raw["streamorde"] >= STREAMORDER_MIN].copy()
+nodes_raw = nodes_raw.loc[
+    (nodes_raw["streamorde"] >= STREAMORDER_MIN) & (nodes_raw["streamorde"] <= STREAMORDER_MAX)
+].copy()
 
 ### Apply same Q repair to histogram view so what you inspect matches training preprocessing
 nodes_raw, _ = interpolate_negative_q_by_comid(
@@ -1168,7 +1198,7 @@ plot_obs_histograms_logy(
     t_col=T_COL,
     bins_q=250,
     bins_t=200,
-    title_suffix=f"(stream order >= {STREAMORDER_MIN})",
+    title_suffix=f"(stream order {STREAMORDER_MIN}-{STREAMORDER_MAX})",
     save_dir=OUTPUTS_DIR,
 )
 
@@ -1187,1172 +1217,10 @@ print(f"\nSaved model/scalers/features to:\n  {SAVE_DIR}\n  model: {MODEL_FILENA
 print(f"Graph smoothness: {USE_GRAPH_SMOOTHNESS} (lambda={LAMBDA_SMOOTH})")
 print("Output head: sigmoid on BOTH Q and Temp (scaled-space bounded)")
 
-
 ## 15. Graph-SHAP interpretation
-#### Standard SHAP is insufficient for a graph model because once message
-#### passing is used, the prediction at a node is influenced by upstream
-#### neighbors — not just that node's own inputs.  This block implements a
-#### three-level Monte Carlo Shapley framework that respects graph structure:
-#
-####   Level 1  Feature Graph-SHAP   — MC Shapley over feature blocks at the
-####            target node (all lags of pr, all lags of tmax, etc.)
-####   Level 2  Temporal Graph-SHAP  — MC Shapley over lag blocks
-####            (all features at t-6, t-5, … t)
-####   Level 3  Node×Feature Heatmap — MC Shapley over every
-####            (upstream_node, feature) pair in the k-hop subgraph
-####   Structural                    — MC Shapley over incoming edges,
-####            capturing synergy / redundancy that leave-one-out misses
-#
-#### Key design choices
-####  • Players are grouped blocks rather than raw lb×F scalar cells,
-####    reducing dimensionality and keeping results interpretable.
-####  • Absent players are replaced with randomly drawn seasonal background
-####    windows (not a fixed mean), making the masking more realistic.
-####  • All explanations are restricted to a k-hop upstream subgraph so the
-####    explanation respects the local routed neighborhood the model uses.
-####  • Returns signed mean + 95 % CI so direction and uncertainty are visible.
-####  • compute_edge_ablation_importance is retained as a fast sanity check;
-####    compute_structural_graphshap_mc is the true Shapley version.
-
-### 15.1 Tuneable knobs
-GRAPHSHAP_N_HOPS         = 2      # upstream subgraph depth
-GRAPHSHAP_N_BACKGROUND   = 40     # distinct windows in masker pool
-GRAPHSHAP_N_EXPLAIN      = 25     # windows to average Shapley over
-GRAPHSHAP_N_MC_PERMS     = 120    # permutations per explain window
-GRAPHSHAP_N_MC_STRUCT    = 100    # permutations for structural SHAP
-GRAPHSHAP_N_MC_NF        = 60     # permutations for node×feature
-GRAPHSHAP_MAX_NF_PLAYERS = 100    # skip node×feature if larger
-GRAPHSHAP_SEASON_DAYS    = 45     # ±days for seasonal background
-
-
-### 15.2 Local upstream subgraph extraction
-#### Extract a k-hop upstream neighborhood around the target node.  Because the
-#### graph is directed upstream → downstream, only nodes that can influence the
-#### target through routing are included — downstream nodes are excluded.  This
-#### keeps the explanation local while preserving the relevant routed structure.
-
-def extract_upstream_subgraph(edge_index, target_node_idx, n_hops=2):
-    """
-    k-hop upstream subgraph, flow = source_to_target (upstream → target).
-
-    Returns
-    -------
-    sub_nodes_global : LongTensor  [Ns]  global node indices
-    edge_index_sub   : LongTensor  [2, Es]  relabeled to subgraph
-    target_sub_idx   : int         position of target in sub_nodes_global
-    """
-    sub_nodes, edge_index_sub, mapping, _ = k_hop_subgraph(
-        node_idx      = target_node_idx,
-        num_hops      = n_hops,
-        edge_index    = edge_index,
-        flow          = "source_to_target",
-        relabel_nodes = True,
-    )
-    target_sub_idx = int(mapping.item()) if mapping.numel() == 1 \
-        else int((sub_nodes == target_node_idx).nonzero(as_tuple=True)[0].item())
-    return sub_nodes, edge_index_sub, target_sub_idx
-
-
-### 15.3 Player (block) definitions
-#### Players are grouped blocks rather than raw lb×F scalar cells, which reduces
-#### the coalition space and makes results interpretable at the feature, lag, or
-#### node×feature level.  Each player is a 3-tuple:
-####   (name, global_node_idx, [flat_indices])
-#### where flat_index = lag * n_features + feat_idx  (row-major over [lb, F])
-
-def make_feature_blocks(target_node_idx, lookback, features):
-    """One player per feature — pools all lags of that feature."""
-    F = len(features)
-    return [
-        (f_name, target_node_idx,
-         [lag * F + f_idx for lag in range(lookback)])
-        for f_idx, f_name in enumerate(features)
-    ]
-
-### Lag blocks (one player per time lag)
-def make_lag_blocks(target_node_idx, lookback, features):
-    """One player per lag — pools all features at that time step."""
-    F = len(features)
-    return [
-        (f"t-{lookback-1-lag}" if lag < lookback - 1 else "t",
-         target_node_idx,
-         list(range(lag * F, (lag + 1) * F)))
-        for lag in range(lookback)
-    ]
-
-### Node x feature blocks (one player per node-feature pair)
-def make_node_feature_blocks(sub_nodes_global, features, target_node_idx, lookback):
-    """One player per (node, feature) — all lags of feature f at node n."""
-    F = len(features)
-    blocks = []
-    for n_g in sub_nodes_global.tolist():
-        label = "target" if n_g == target_node_idx else f"up_{n_g}"
-        for f_idx, f_name in enumerate(features):
-            blocks.append((
-                f"{label}/{f_name}",
-                int(n_g),
-                [lag * F + f_idx for lag in range(lookback)]
-            ))
-    return blocks
-
-
-### 15.4 Seasonal background pool
-#### Background windows are drawn from seasonally similar periods (±season_window_days
-#### of day-of-year) rather than random dates, making the absent-player baseline
-#### more realistic than a fixed mean or a fully random sample.
-
-def build_background_pool(X_TNF, test_indices, dates, sub_nodes_global,
-                          lookback, n_samples, target_date=None,
-                          season_window_days=45, seed=42):
-    """
-    Returns bg_pool: {global_node_idx: list of [lb*F] float32 arrays}
-    Drawn from seasonally similar test windows (falls back to random).
-    """
-    sub_set = sub_nodes_global.tolist()
-
-    # Seasonal selection
-    if target_date is not None:
-        td  = pd.Timestamp(target_date)
-        tdoy = td.day_of_year
-        pool_idx = [
-            ti for ti in test_indices
-            if abs(pd.Timestamp(dates[ti + lookback]).day_of_year - tdoy)
-               <= season_window_days
-        ]
-        if len(pool_idx) < max(10, n_samples // 2):
-            pool_idx = list(test_indices)
-    else:
-        pool_idx = list(test_indices)
-
-    rng = np.random.default_rng(seed)
-    chosen = rng.choice(pool_idx,
-                        size=min(n_samples, len(pool_idx)),
-                        replace=False)
-
-    bg_pool = {int(ng): [] for ng in sub_set}
-    for ti in chosen:
-        t0 = ti + 1
-        t1 = ti + lookback + 1
-        x_np = X_TNF[t0:t1].transpose(1, 0, 2).astype(np.float32)  # [N, lb, F]
-        for ng in sub_set:
-            bg_pool[ng].append(x_np[ng].reshape(-1))  # [lb*F]
-
-    return bg_pool, list(chosen)
-
-
-### 15.5 Graph-aware coalition reconstructor
-#### Absent players → background values; present players → actual explain values.
-#### Masking is graph-aware: all subgraph nodes start from background, then only
-#### the coalition members have their explain-window values restored.  This keeps
-#### the explanation grounded in the local routed neighborhood.
-
-#### NOTE: this function is defined a second time in the Graph-SHAP utilities below; the later definition is the one in effect
-def reconstruct_from_coalition(
-    coalition_mask,      # bool [n_players]
-    player_blocks,       # list of (name, node_g, flat_idxs)
-    x_explain_full,      # np.ndarray [N_global, lb, F]  explain window
-    bg_by_node,          # {node_g: np.ndarray [lb*F]} one drawn background
-    sub_nodes_global,    # node indices that are "in play"
-    lookback, n_features, device
-):
-    """
-    Start from explain data for ALL nodes.
-    For nodes in the subgraph, replace with background (absent = background).
-    For players in the coalition (mask=True), restore their explain values.
-    """
-    x_win = torch.FloatTensor(x_explain_full).to(device)   # [N, lb, F]
-
-    # Step 1: all subgraph nodes → background
-    for ng in sub_nodes_global.tolist():
-        x_win[ng] = torch.FloatTensor(
-            bg_by_node[ng].reshape(lookback, n_features)
-        ).to(device)
-
-    # Step 2: coalition players → restore explain values
-    F = n_features
-    for p_idx, (_, node_g, flat_idxs) in enumerate(player_blocks):
-        if coalition_mask[p_idx]:
-            ex_flat = x_explain_full[node_g].reshape(-1)  # [lb*F]
-            for fi in flat_idxs:
-                lag_i  = fi // F
-                feat_i = fi %  F
-                x_win[node_g, lag_i, feat_i] = float(ex_flat[fi])
-
-    return x_win   # [N, lb, F]  on device
-
-
-### 15.6 Monte Carlo Shapley core
-#### Shared estimator used by all three feature levels.  For each explain window,
-#### random player orderings are sampled and the marginal contribution of each
-#### player is accumulated as it enters the coalition.  Repeating across windows
-#### yields a signed mean with a 95 % CI so both magnitude and direction are
-#### visible in the final output.
-
-def mc_shapley_over_blocks(
-    model, edge_index,
-    X_TNF, test_indices, dates,
-    player_blocks,
-    sub_nodes_global, target_node_idx,
-    lookback, n_features,
-    n_background, n_explain, n_mc_perms,
-    target_output, device,
-    background_indices=None,
-    season_window_days=45, seed=0,
-):
-    """
-    Generic MC Shapley estimator over any grouped player set.
-
-    background_indices : list of dataset indices used to build the background
-        reference pool.  Should be the TRAINING indices so the baseline
-        represents the model's learned distribution, not the same test windows
-        being explained.  If None, falls back to test_indices (not recommended).
-
-    Returns
-    -------
-    shap_mean  : [n_players]  mean signed Shapley (in scaled prediction space)
-    shap_std   : [n_players]  std error across explain windows
-    shap_ci95  : [n_players]  95 % CI half-width (1.96 × std)
-    """
-    model.eval()
-    n_players  = len(player_blocks)
-    rng        = np.random.default_rng(seed)
-    F          = n_features
-
-    # Explain windows drawn from test period
-    exp_sample = rng.choice(len(test_indices),
-                            size=min(n_explain, len(test_indices)),
-                            replace=False)
-    exp_tis = [test_indices[int(i)] for i in exp_sample]
-
-    # Background pool drawn from training period (separate from explain windows)
-    bg_source = background_indices if background_indices is not None else test_indices
-    bg_pool_all, _ = build_background_pool(
-        X_TNF, bg_source, dates, sub_nodes_global,
-        lookback, n_background,
-        target_date=None,
-        season_window_days=season_window_days,
-        seed=seed + 1,
-    )
-    n_bg_samples = min(len(v) for v in bg_pool_all.values() if v)
-
-    shap_per_window = np.zeros((n_explain, n_players), dtype=np.float64)
-
-    for ei, ti in enumerate(exp_tis):
-        t0 = ti + 1
-        t1 = ti + lookback + 1
-        x_explain_full = X_TNF[t0:t1].transpose(1, 0, 2).astype(np.float32)  # [N, lb, F]
-
-        sv = np.zeros(n_players, dtype=np.float64)
-
-        for _ in range(n_mc_perms):
-            perm         = rng.permutation(n_players)
-            bg_draw_idx  = int(rng.integers(0, n_bg_samples))
-            bg_by_node   = {ng: bg_pool_all[ng][bg_draw_idx]
-                            for ng in sub_nodes_global.tolist()}
-
-            coalition = np.zeros(n_players, dtype=bool)
-            x_prev    = reconstruct_from_coalition(
-                coalition, player_blocks, x_explain_full,
-                bg_by_node, sub_nodes_global, lookback, F, device
-            )
-            with torch.no_grad():
-                prev_pred = model(x_prev, edge_index, return_logits=True)[target_node_idx, target_output].item()
-
-            for pos in perm:
-                coalition[pos] = True
-                x_new = reconstruct_from_coalition(
-                    coalition, player_blocks, x_explain_full,
-                    bg_by_node, sub_nodes_global, lookback, F, device
-                )
-                with torch.no_grad():
-                    new_pred = model(x_new, edge_index, return_logits=True)[target_node_idx, target_output].item()
-
-                sv[pos] += (new_pred - prev_pred)
-                prev_pred = new_pred
-
-        sv /= n_mc_perms
-        shap_per_window[ei] = sv
-
-    shap_mean = np.mean(shap_per_window, axis=0)
-    shap_std  = np.std(shap_per_window, axis=0) / np.sqrt(max(n_explain, 1))
-    shap_ci95 = 1.96 * shap_std
-
-    return shap_mean, shap_std, shap_ci95
-
-
-### 15.7 Structural Graph-SHAP — MC Shapley over incoming edges
-#### Separates the role of graph structure from node features by computing
-#### true Shapley values over the set of incoming edges to the target node.
-#### Captures synergy and redundancy among upstream connections that a simple
-#### leave-one-edge-out ablation cannot detect.
-
-def compute_structural_graphshap_mc(
-    model, edge_index,
-    X_TNF, test_indices,
-    target_node_idx,
-    lookback,
-    n_explain=20, n_mc_perms=100,
-    target_output=0, device="cpu", seed=10,
-):
-    """
-    True MC Shapley over incoming edges to target_node_idx.
-    Captures edge synergy / redundancy that leave-one-out misses.
-    """
-    model.eval()
-    rng = np.random.default_rng(seed)
-
-    incoming_ids = torch.where(edge_index[1] == target_node_idx)[0].tolist()
-    if not incoming_ids:
-        print(f"[Structural SHAP] No incoming edges to node {target_node_idx}.")
-        return np.array([]), np.array([]), np.array([]), []
-
-    n_players    = len(incoming_ids)
-    edge_players = [(int(edge_index[0, ei]), int(edge_index[1, ei]))
-                    for ei in incoming_ids]
-
-    cand_mask_base = torch.zeros(edge_index.shape[1], dtype=torch.bool, device=device)
-    for ei in incoming_ids:
-        cand_mask_base[ei] = True
-
-    exp_tis = [test_indices[int(i)]
-               for i in rng.choice(len(test_indices),
-                                   size=min(n_explain, len(test_indices)),
-                                   replace=False)]
-
-    shap_per_window = np.zeros((n_explain, n_players), dtype=np.float64)
-
-    for ei_w, ti in enumerate(exp_tis):
-        t0 = ti + 1
-        t1 = ti + lookback + 1
-        x_win = torch.FloatTensor(
-            X_TNF[t0:t1].transpose(1, 0, 2).astype(np.float32)
-        ).to(device)  # [N, lb, F]
-
-        sv = np.zeros(n_players, dtype=np.float64)
-
-        for _ in range(n_mc_perms):
-            perm   = rng.permutation(n_players)
-            active = []
-
-            keep = ~cand_mask_base.clone()
-            with torch.no_grad():
-                prev_pred = model(x_win, edge_index[:, keep], return_logits=True)[target_node_idx, target_output].item()
-
-            for pos in perm:
-                active.append(pos)
-                keep = ~cand_mask_base.clone()
-                for ap in active:
-                    keep[incoming_ids[ap]] = True
-
-                with torch.no_grad():
-                    new_pred = model(x_win, edge_index[:, keep], return_logits=True)[target_node_idx, target_output].item()
-
-                sv[pos] += (new_pred - prev_pred)
-                prev_pred = new_pred
-
-        sv /= n_mc_perms
-        shap_per_window[ei_w] = sv
-
-    shap_mean = np.mean(shap_per_window, axis=0)
-    shap_std  = np.std(shap_per_window, axis=0) / np.sqrt(max(n_explain, 1))
-    shap_ci95 = 1.96 * shap_std
-
-    return shap_mean, shap_std, shap_ci95, edge_players
-
-
-### 15.8 Edge ablation — fast structural sanity check
-#### Single-edge leave-one-out ablation: much faster than full Shapley but
-#### cannot capture edge interactions.  Use this to quickly verify that the
-#### broader pattern of structural Shapley results is consistent, or when the
-#### number of incoming edges makes MC Shapley too expensive.
-
-def compute_edge_ablation_importance(
-    model, edge_index, x_win_sample,
-    target_node_idx, target_output=0, device="cpu"
-):
-    """
-    Fast single-edge leave-one-out ablation (NOT full Shapley).
-    Use as a quick sanity check or when n_incoming_edges > 30.
-    """
-    model.eval()
-    x = x_win_sample.to(device)
-    with torch.no_grad():
-        baseline = model(x, edge_index, return_logits=True)[target_node_idx, target_output].item()
-
-    incoming = torch.where(edge_index[1] == target_node_idx)[0].tolist()
-    scores   = {}
-    for ei in incoming:
-        keep = torch.ones(edge_index.shape[1], dtype=torch.bool, device=device)
-        keep[ei] = False
-        with torch.no_grad():
-            # return_logits=True keeps units consistent with the MC-Shapley baseline
-            p = model(x, edge_index[:, keep], return_logits=True)[target_node_idx, target_output].item()
-        src = int(edge_index[0, ei])
-        dst = int(edge_index[1, ei])
-        scores[(src, dst)] = baseline - p
-
-    return scores, baseline
-
-
-### 15.9 Graph-SHAP visualization helpers
-#### Ranked horizontal bar charts with 95 % CI error bars for all Shapley levels.
-#### Node×feature results also render as a diverging-color heatmap so the spatial
-#### pattern of upstream influence is immediately visible.  All outputs are saved
-#### to OUTPUTS_DIR; plt.show() is replaced with plt.close() so plots never block
-#### script execution.
-
-def plot_graphshap_bars(shap_mean, shap_ci95, player_names,
-                        title, xlabel="Mean Shapley value (signed)",
-                        max_show=30, save_path=None):
-    sort_idx = np.argsort(np.abs(shap_mean))[::-1][:max_show]
-    names = [player_names[i] for i in sort_idx]
-    means = shap_mean[sort_idx]
-    cis   = shap_ci95[sort_idx]
-    colors = ["steelblue" if m >= 0 else "coral" for m in means]
-
-    fig, ax = plt.subplots(figsize=(10, max(4, len(names) * 0.38)))
-    y = np.arange(len(names))
-    ax.barh(y, means, xerr=cis, color=colors, align="center", height=0.7,
-            error_kw=dict(ecolor="black", capsize=3, linewidth=1.1))
-    ax.axvline(0, color="black", lw=0.8, ls="--")
-    ax.set_yticks(y)
-    ax.set_yticklabels(names, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel(xlabel)
-    ax.set_title(title)
-    # Value labels on each bar so small contributions are legible
-    x_range = max(np.abs(means).max(), 1e-12)
-    for yi, m in enumerate(means):
-        offset = x_range * 0.02
-        ha = "left" if m >= 0 else "right"
-        ax.text(m + (offset if m >= 0 else -offset), yi,
-                f"{m:+.2e}", va="center", ha=ha, fontsize=6.5)
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved: {save_path}")
-    plt.close(fig)
-    return fig
-
-
-### Node x feature heatmap plot
-def plot_node_feature_heatmap(shap_mean, player_blocks_nf,
-                               sub_nodes_global, features_list,
-                               target_node_idx, idx_to_comid,
-                               title, save_path=None):
-    sub_nodes = [int(n) for n in sub_nodes_global.tolist()]
-    F  = len(features_list)
-    ns = len(sub_nodes)
-    mat = np.zeros((ns, F), dtype=float)
-
-    node_labels = []
-    for ni, ng in enumerate(sub_nodes):
-        cid  = idx_to_comid.get(ng, ng)
-        role = f"★ target ({cid})" if ng == target_node_idx else str(cid)
-        node_labels.append(role)
-
-    for pi, (_, node_g, flat_idxs) in enumerate(player_blocks_nf):
-        ni    = sub_nodes.index(node_g)
-        f_idx = flat_idxs[0] % F
-        mat[ni, f_idx] = shap_mean[pi]
-
-    vmax = max(np.abs(mat).max(), 1e-12)
-    fig, ax = plt.subplots(figsize=(max(12, F * 0.65), max(4, ns * 0.5)))
-    im = ax.imshow(mat, aspect="auto", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-    ax.set_xticks(np.arange(F))
-    ax.set_xticklabels(features_list, rotation=55, ha="right", fontsize=7)
-    ax.set_yticks(np.arange(ns))
-    ax.set_yticklabels(node_labels, fontsize=8)
-    fig.colorbar(im, ax=ax, label="Shapley value (signed, logit space)")
-    ax.set_title(title)
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved: {save_path}")
-    plt.close(fig)
-    return fig
-
-### 15.10 Graph-SHAP utilities
-
-#### NOTE: redefinition of reconstruct_from_coalition from 15.5; this later version overrides the earlier one
-def reconstruct_from_coalition(
-    coalition_mask,
-    player_blocks,
-    x_explain,
-    bg_draw,
-    sub_nodes,
-    lookback,
-    n_features,
-    device,
-):
-    """
-    Reconstruct a masked sample for Graph-SHAP.
-
-    Expected inputs
-    ---------------
-    coalition_mask : array-like of bool, shape [n_players]
-        True  -> keep that player block from x_explain
-        False -> replace that player block with background values
-
-    player_blocks : list
-        Each block must be of the form:
-            (name, node_idx, flat_positions)
-        or
-            (name, node_idx, flat_positions, *extras)
-
-        where flat_idx = lag_idx * n_features + feat_idx
-
-    x_explain : np.ndarray or torch.Tensor, shape [N, lookback, F]
-        The explained sample in node-major format.
-
-    bg_draw : dict
-        Background draw keyed by local node index.
-        Each value may be:
-            - [lookback, F]
-            - [F, lookback]
-            - [1, lookback, F]
-            - [lookback * F]
-        This function standardizes to [lookback, F].
-
-    sub_nodes : array-like
-        Present for interface compatibility; not used here except for length checks.
-
-    Returns
-    -------
-    torch.FloatTensor, shape [N, lookback, F]
-    """
-    import numpy as np
-    import torch
-
-    if isinstance(x_explain, torch.Tensor):
-        x_rec = x_explain.detach().cpu().numpy().copy()
-    else:
-        x_rec = np.array(x_explain, dtype=np.float32, copy=True)
-
-    if x_rec.ndim != 3:
-        raise ValueError(f"x_explain must be 3D [N, lookback, F], got shape {x_rec.shape}")
-
-    n_nodes, lb, nf = x_rec.shape
-    if lb != lookback or nf != n_features:
-        raise ValueError(
-            f"x_explain shape mismatch: got {x_rec.shape}, expected [N, {lookback}, {n_features}]"
-        )
-
-    coalition_mask = np.asarray(coalition_mask).astype(bool)
-    if len(coalition_mask) != len(player_blocks):
-        raise ValueError(
-            f"coalition_mask length {len(coalition_mask)} != number of blocks {len(player_blocks)}"
-        )
-
-    bg_std = {}
-    for node_idx, arr in bg_draw.items():
-        node_idx = int(node_idx)
-
-        if isinstance(arr, torch.Tensor):
-            a = arr.detach().cpu().numpy()
-        else:
-            a = np.asarray(arr)
-
-        if a.ndim == 3 and a.shape[0] == 1:
-            a = a[0]
-
-        if a.ndim == 1:
-            if a.size != lookback * n_features:
-                raise ValueError(
-                    f"Background for node {node_idx} has flat size {a.size}, "
-                    f"expected {lookback * n_features}"
-                )
-            a = a.reshape(lookback, n_features)
-
-        elif a.ndim == 2 and a.shape == (n_features, lookback):
-            a = a.T
-
-        elif a.ndim == 2 and a.shape == (lookback, n_features):
-            pass
-
-        else:
-            raise ValueError(
-                f"Background for node {node_idx} has unsupported shape {a.shape}; "
-                f"expected [lookback, F], [F, lookback], [1, lookback, F], or flat."
-            )
-
-        bg_std[node_idx] = a.astype(np.float32, copy=False)
-
-    for p_idx, block in enumerate(player_blocks):
-        if len(block) < 3:
-            raise ValueError(f"Malformed block at index {p_idx}: {block}")
-
-        _, node_idx, flat_idxs = block[:3]
-        node_idx = int(node_idx)
-
-        if coalition_mask[p_idx]:
-            continue
-
-        if node_idx < 0 or node_idx >= n_nodes:
-            continue
-
-        if node_idx not in bg_std:
-            raise KeyError(f"Missing background draw for node {node_idx}")
-
-        bg_node = bg_std[node_idx]
-
-        for flat_idx in flat_idxs:
-            flat_idx = int(flat_idx)
-            lag_idx = flat_idx // n_features
-            feat_idx = flat_idx % n_features
-
-            if not (0 <= lag_idx < lookback and 0 <= feat_idx < n_features):
-                raise ValueError(
-                    f"Flat index {flat_idx} out of range -> (lag={lag_idx}, feat={feat_idx})"
-                )
-
-            x_rec[node_idx, lag_idx, feat_idx] = bg_node[lag_idx, feat_idx]
-
-    return torch.tensor(x_rec, dtype=torch.float32, device=device)
-
-
-### 15.11 Graph-SHAP runner
-#### Orchestrates all four explanation levels for each target variable (Q, Temp)
-#### at TARGET_COMID_FOR_PLOTS. The upstream subgraph is extracted once and then
-#### all block-based Graph-SHAP runs are performed in LOCAL subgraph index space
-#### to avoid global/local node-index mismatches.
-#
-#### IMPORTANT:
-#### The internal Graph-SHAP utilities expect block definitions in the form:
-####     (name, node_idx, flat_positions)
-#### where:
-####     flat_idx = lag_idx * n_features + feat_idx
-#
-#### Therefore we DO NOT convert blocks to (node, lag, feat) triplets here.
-#### We only remap node_idx from global graph indexing to local subgraph indexing.
-
-print("\n" + "=" * 65)
-print("FULL GRAPH-SHAP  —  three-level analysis")
-print("=" * 65)
-
-idx_to_comid      = {v: k for k, v in comid_to_idx.items()}
-target_node_idx_g = comid_to_idx[TARGET_COMID_FOR_PLOTS]
-
-
-### 15.12 Helper utilities for consistent local-subgraph Graph-SHAP
-def build_local_subgraph_inputs(X_TNF, sub_nodes_g):
-    """
-    Restrict full [T, N, F] tensor to local upstream subgraph order.
-    Returns [T, N_sub, F].
-    """
-    sub_nodes_np = np.asarray(sub_nodes_g, dtype=np.int64)
-    return X_TNF[:, sub_nodes_np, :].astype(np.float32)
-
-
-### Decode flat positions into (lag, feature) for diagnostics
-def flat_positions_to_lag_feat(flat_positions, n_features):
-    """
-    Decode flat positions into (lag_idx, feat_idx) for diagnostics only.
-    Expected flattening:
-        flat_idx = lag_idx * n_features + feat_idx
-    """
-    out = []
-    for fp in flat_positions:
-        fp = int(fp)
-        lag_idx  = fp // n_features
-        feat_idx = fp % n_features
-        out.append((lag_idx, feat_idx))
-    return out
-
-
-### Remap blocks from global to local subgraph node indexing
-def remap_any_blocks_to_local(blocks_global, global_to_local, label="blocks"):
-    """
-    Remap block definitions from global node indexing to local subgraph indexing
-    while preserving the ORIGINAL block structure expected by the SHAP functions.
-
-    Supported observed format:
-      (name, global_node_idx, flat_positions)
-      (name, global_node_idx, flat_positions, *extras)
-
-    Output format:
-      (name, local_node_idx, flat_positions)
-      (name, local_node_idx, flat_positions, *extras)
-    """
-    blocks_local = []
-
-    for bi, block in enumerate(blocks_global):
-        if not isinstance(block, (tuple, list)):
-            raise TypeError(f"[{label}] block {bi} is not tuple/list: {type(block)}")
-
-        if len(block) < 3:
-            raise ValueError(f"[{label}] expected at least 3 elements, got: {block}")
-
-        block_name = block[0]
-        node_idx_g = int(block[1])
-        flat_positions = block[2]
-        extras = list(block[3:]) if len(block) > 3 else []
-
-        if not isinstance(flat_positions, (list, tuple, np.ndarray)):
-            raise TypeError(
-                f"[{label}] block '{block_name}' flat positions are not iterable: "
-                f"{type(flat_positions)}"
-            )
-
-        if node_idx_g not in global_to_local:
-            node_idx_l = -1
-            flat_positions_l = list(flat_positions)
-        else:
-            node_idx_l = global_to_local[node_idx_g]
-            flat_positions_l = list(flat_positions)
-
-        block_local = tuple([block_name, node_idx_l, flat_positions_l] + extras)
-        blocks_local.append(block_local)
-
-    return blocks_local
-
-
-### Validate block indices
-def check_block_indices(blocks, n_nodes, lookback, n_features, label="blocks"):
-    """
-    Validate blocks in ORIGINAL flat-index schema:
-      (name, node_idx, flat_positions)
-    """
-    bad = 0
-    total_flat = 0
-
-    for block in blocks:
-        if not isinstance(block, (tuple, list)) or len(block) < 3:
-            print(f"[WARN:{label}] malformed block header: {block}")
-            bad += 1
-            continue
-
-        name = block[0]
-        node_idx = int(block[1])
-        flat_positions = block[2]
-
-        if not isinstance(flat_positions, (list, tuple, np.ndarray)):
-            print(f"[WARN:{label}] flat_positions malformed in '{name}': {type(flat_positions)}")
-            bad += 1
-            continue
-
-        if not (0 <= node_idx < n_nodes):
-            bad += 1
-            if bad <= 10:
-                print(f"[WARN:{label}] node index out of bounds in '{name}': {node_idx}")
-
-        for fp in flat_positions:
-            total_flat += 1
-            fp = int(fp)
-            lag_idx  = fp // n_features
-            feat_idx = fp % n_features
-
-            ok = (0 <= lag_idx < lookback) and (0 <= feat_idx < n_features)
-            if not ok:
-                bad += 1
-                if bad <= 10:
-                    print(f"[WARN:{label}] bad flat index in '{name}': "
-                          f"flat={fp} -> (lag={lag_idx}, feat={feat_idx})")
-
-    if bad == 0:
-        print(f"[OK:{label}] all {total_flat} flat indices are valid for local subgraph tensor.")
-    else:
-        print(f"[WARN:{label}] {bad}/{max(total_flat,1)} issues found while checking block indices.")
-
-
-### Summarize how much a reconstructed tensor changed
-def summarize_tensor_change(x_a, x_b, name_a="A", name_b="B"):
-    """
-    Quick numeric diagnostic for reconstructed tensors.
-    Accepts numpy arrays or torch tensors.
-    """
-    if isinstance(x_a, torch.Tensor):
-        xa = x_a.detach().cpu().numpy()
-    else:
-        xa = np.asarray(x_a)
-
-    if isinstance(x_b, torch.Tensor):
-        xb = x_b.detach().cpu().numpy()
-    else:
-        xb = np.asarray(x_b)
-
-    d = np.abs(xa - xb)
-    print(f"[Tensor diff] {name_a} vs {name_b}: "
-          f"sum={d.sum():.6f}  mean={d.mean():.6f}  max={d.max():.6f}")
-
-
-### Sensitivity diagnostic on FULL graph
-#### This confirms the trained model itself is responsive to the target node.
-model.eval()
-_ti = test_indices[0]
-_t0, _t1 = _ti + 1, _ti + LOOKBACK + 1
-with torch.no_grad():
-    _x_orig  = torch.FloatTensor(X_TNF[_t0:_t1].transpose(1, 0, 2)).to(device)  # [N, lb, F]
-    _x_bg    = _x_orig.clone()
-    _x_bg[target_node_idx_g] = 0.0
-    _p_orig  = model(_x_orig, edge_index, return_logits=True)[target_node_idx_g, 0].item()
-    _p_bg    = model(_x_bg,   edge_index, return_logits=True)[target_node_idx_g, 0].item()
-
-print(f"\n[Sensitivity check]  Q  target node (logit space):")
-print(f"  logit (original input) = {_p_orig:.6f}")
-print(f"  logit (target zeroed)  = {_p_bg:.6f}")
-print(f"  Δ = {abs(_p_bg - _p_orig):.6f}  "
-      f"{'✓ model is sensitive' if abs(_p_bg - _p_orig) > 1e-4 else '✗ WARNING: model output unchanged in logit space — SHAP values will be zero'}")
-del _ti, _t0, _t1, _x_orig, _x_bg, _p_orig, _p_bg
-
-
-### Extract local subgraph once
-sub_nodes_g, edge_index_sub_g, target_sub_idx_g = extract_upstream_subgraph(
-    edge_index      = edge_index,
-    target_node_idx = target_node_idx_g,
-    n_hops          = GRAPHSHAP_N_HOPS,
-)
-sub_nodes_g = np.asarray(sub_nodes_g, dtype=np.int64)
-n_sub = sub_nodes_g.shape[0]
-
-global_to_local = {int(g): i for i, g in enumerate(sub_nodes_g.tolist())}
-local_to_global = {i: int(g) for i, g in enumerate(sub_nodes_g.tolist())}
-
-print(f"\n{GRAPHSHAP_N_HOPS}-hop upstream subgraph around COMID {TARGET_COMID_FOR_PLOTS}:")
-print(f"  Nodes : {n_sub}  |  Edges : {edge_index_sub_g.shape[1]}")
-up_comids = [idx_to_comid.get(int(n), n) for n in sub_nodes_g.tolist()
-             if int(n) != target_node_idx_g]
-print(f"  Upstream COMIDs: {up_comids}")
-print(f"  Global target idx : {target_node_idx_g}")
-print(f"  Local  target idx : {target_sub_idx_g}")
-
-### Build local [T, N_sub, F] tensor for all block-based Graph-SHAP
-X_TNF_sub = build_local_subgraph_inputs(X_TNF, sub_nodes_g)
-
-### Block-level perturbation check in LOCAL subgraph space
-#### This tests the exact masking route used by block-based Graph-SHAP.
-_feat_blocks_chk_global = make_feature_blocks(target_node_idx_g, LOOKBACK, FEATURES)
-
-print("\n[Debug] first 3 raw feature blocks:")
-for _b in _feat_blocks_chk_global[:3]:
-    print("  ", type(_b), _b if len(str(_b)) < 250 else str(_b)[:250] + " ...")
-
-_feat_blocks_chk_local = remap_any_blocks_to_local(
-    _feat_blocks_chk_global,
-    global_to_local,
-    label="feature check blocks"
-)
-
-print("\n[Debug] first 3 remapped feature blocks:")
-for _b in _feat_blocks_chk_local[:3]:
-    print("  ", type(_b), _b if len(str(_b)) < 250 else str(_b)[:250] + " ...")
-    _nm, _nd, _fp = _b[:3]
-    print("     decoded:", flat_positions_to_lag_feat(_fp[:min(5, len(_fp))], len(FEATURES)))
-
-check_block_indices(
-    _feat_blocks_chk_local,
-    n_nodes=n_sub,
-    lookback=LOOKBACK,
-    n_features=len(FEATURES),
-    label="L1 feature blocks"
-)
-
-_ti_chk = test_indices[0]
-_t0_chk, _t1_chk = _ti_chk + 1, _ti_chk + LOOKBACK + 1
-
-### local explained sample: [N_sub, lb, F]
-_x_exp_chk = X_TNF_sub[_t0_chk:_t1_chk].transpose(1, 0, 2).astype(np.float32)
-
-### training-period background pool built in LOCAL subgraph space
-_bg_pool_chk, _ = build_background_pool(
-    X_TNF_sub,
-    train_indices,
-    dates,
-    np.arange(n_sub, dtype=np.int64),
-    LOOKBACK,
-    n_samples=5,
-    seed=999,
-)
-
-_bg_draw_chk = {ng: _bg_pool_chk[ng][0] for ng in range(n_sub)}
-
-print("\n[Block-level perturbation check]  (LOCAL subgraph, logit space)")
-for _tgt_o, _tgt_n in [(0, "Q"), (1, "Temp")]:
-    _all_present = np.ones(len(_feat_blocks_chk_local), dtype=bool)
-    _x_full = reconstruct_from_coalition(
-        _all_present,
-        _feat_blocks_chk_local,
-        _x_exp_chk,
-        _bg_draw_chk,
-        np.arange(n_sub, dtype=np.int64),
-        LOOKBACK,
-        len(FEATURES),
-        device
-    )
-
-    _all_absent = np.zeros(len(_feat_blocks_chk_local), dtype=bool)
-    _x_absent = reconstruct_from_coalition(
-        _all_absent,
-        _feat_blocks_chk_local,
-        _x_exp_chk,
-        _bg_draw_chk,
-        np.arange(n_sub, dtype=np.int64),
-        LOOKBACK,
-        len(FEATURES),
-        device
-    )
-
-    summarize_tensor_change(_x_full, _x_absent, "full", "absent")
-
-    with torch.no_grad():
-        _p_full   = model(_x_full,   edge_index_sub_g, return_logits=True)[target_sub_idx_g, _tgt_o].item()
-        _p_absent = model(_x_absent, edge_index_sub_g, return_logits=True)[target_sub_idx_g, _tgt_o].item()
-
-    _delta = abs(_p_full - _p_absent)
-    _ok = "✓" if _delta > 1e-4 else "✗ WARNING — masking has no effect"
-    print(f"  {_tgt_n}  full={_p_full:+.5f}  absent={_p_absent:+.5f}  Δ={_delta:.5f}  {_ok}")
-
-print("\n[Sanity] target-node explained slice, first 2 lags × first 5 feats:")
-print(_x_exp_chk[target_sub_idx_g, :2, :5])
-
-print("\n[Sanity] target-node FULL reconstructed slice:")
-print(_x_full.detach().cpu().numpy()[target_sub_idx_g, :2, :5])
-
-print("\n[Sanity] target-node ABSENT reconstructed slice:")
-print(_x_absent.detach().cpu().numpy()[target_sub_idx_g, :2, :5])
-
-del (
-    _feat_blocks_chk_global, _feat_blocks_chk_local,
-    _ti_chk, _t0_chk, _t1_chk,
-    _x_exp_chk, _bg_pool_chk, _bg_draw_chk,
-    _x_full, _x_absent, _p_full, _p_absent, _delta, _ok,
-    _all_present, _all_absent
-)
-
-
-### Main Graph-SHAP loop
-#### NOTE:
-####   L1/L2/L3 are now all run in LOCAL subgraph space.
-####   Structural Graph-SHAP remains on the FULL graph.
-for tgt_out, tgt_name in [(0, "Q"), (1, "Temp")]:
-    print(f"\n{'─'*60}")
-    print(f"  {tgt_name}  at  COMID {TARGET_COMID_FOR_PLOTS}")
-    print(f"{'─'*60}")
-
-    ### Level 1: Feature blocks at target node
-    print("\n[L1] Feature blocks (MC Shapley, LOCAL subgraph) …")
-    feat_blocks_global = make_feature_blocks(target_node_idx_g, LOOKBACK, FEATURES)
-    feat_blocks_local = remap_any_blocks_to_local(
-        feat_blocks_global,
-        global_to_local,
-        label=f"L1 feature blocks ({tgt_name})"
-    )
-
-    check_block_indices(
-        feat_blocks_local,
-        n_nodes=n_sub,
-        lookback=LOOKBACK,
-        n_features=len(FEATURES),
-        label=f"L1 feature blocks ({tgt_name})"
-    )
-
-    sv_f_mean, sv_f_std, sv_f_ci = mc_shapley_over_blocks(
-        model=model,
-        edge_index=edge_index_sub_g,
-        X_TNF=X_TNF_sub,
-        test_indices=test_indices,
-        dates=dates,
-        player_blocks=feat_blocks_local,
-        sub_nodes_global=np.arange(n_sub, dtype=np.int64),
-        target_node_idx=target_sub_idx_g,
-        lookback=LOOKBACK,
-        n_features=len(FEATURES),
-        n_background=GRAPHSHAP_N_BACKGROUND,
-        n_explain=GRAPHSHAP_N_EXPLAIN,
-        n_mc_perms=GRAPHSHAP_N_MC_PERMS,
-        target_output=tgt_out,
-        device=str(device),
-        background_indices=train_indices,
-        season_window_days=GRAPHSHAP_SEASON_DAYS,
-    )
-
-    feat_names = [b[0] for b in feat_blocks_local]
-    print("  Top features:")
-    for ri in np.argsort(np.abs(sv_f_mean))[::-1][:5]:
-        s = "↑" if sv_f_mean[ri] >= 0 else "↓"
-        print(f"    {s} {feat_names[ri]:>12s}  φ={sv_f_mean[ri]:+.8f}  ±{sv_f_ci[ri]:.8f}")
-
-    plot_graphshap_bars(
-        sv_f_mean,
-        sv_f_ci,
-        feat_names,
-        title=f"Feature Graph-SHAP  |  {tgt_name}  |  COMID {TARGET_COMID_FOR_PLOTS}",
-        save_path=os.path.join(OUTPUTS_DIR, f"graphshap_L1_feat_{tgt_name}_{TARGET_COMID_FOR_PLOTS}.png"),
-    )
-
-    np.save(os.path.join(SAVE_DIR, f"graphshap_L1_feat_{tgt_name}_mean.npy"), sv_f_mean)
-    np.save(os.path.join(SAVE_DIR, f"graphshap_L1_feat_{tgt_name}_ci95.npy"), sv_f_ci)
-
-    ### Level 2: Lag blocks
-    print("\n[L2] Lag blocks (MC Shapley, LOCAL subgraph) …")
-    lag_blocks_global = make_lag_blocks(target_node_idx_g, LOOKBACK, FEATURES)
-    lag_blocks_local = remap_any_blocks_to_local(
-        lag_blocks_global,
-        global_to_local,
-        label=f"L2 lag blocks ({tgt_name})"
-    )
-
-    check_block_indices(
-        lag_blocks_local,
-        n_nodes=n_sub,
-        lookback=LOOKBACK,
-        n_features=len(FEATURES),
-        label=f"L2 lag blocks ({tgt_name})"
-    )
-
-    sv_l_mean, sv_l_std, sv_l_ci = mc_shapley_over_blocks(
-        model=model,
-        edge_index=edge_index_sub_g,
-        X_TNF=X_TNF_sub,
-        test_indices=test_indices,
-        dates=dates,
-        player_blocks=lag_blocks_local,
-        sub_nodes_global=np.arange(n_sub, dtype=np.int64),
-        target_node_idx=target_sub_idx_g,
-        lookback=LOOKBACK,
-        n_features=len(FEATURES),
-        n_background=GRAPHSHAP_N_BACKGROUND,
-        n_explain=GRAPHSHAP_N_EXPLAIN,
-        n_mc_perms=GRAPHSHAP_N_MC_PERMS,
-        target_output=tgt_out,
-        device=str(device),
-        background_indices=train_indices,
-        season_window_days=GRAPHSHAP_SEASON_DAYS,
-    )
-
-    lag_names = [b[0] for b in lag_blocks_local]
-    plot_graphshap_bars(
-        sv_l_mean,
-        sv_l_ci,
-        lag_names,
-        title=f"Temporal Graph-SHAP  |  {tgt_name}  |  COMID {TARGET_COMID_FOR_PLOTS}",
-        save_path=os.path.join(OUTPUTS_DIR, f"graphshap_L2_lags_{tgt_name}_{TARGET_COMID_FOR_PLOTS}.png"),
-        max_show=LOOKBACK,
-    )
-
-    np.save(os.path.join(SAVE_DIR, f"graphshap_L2_lags_{tgt_name}_mean.npy"), sv_l_mean)
-    np.save(os.path.join(SAVE_DIR, f"graphshap_L2_lags_{tgt_name}_ci95.npy"), sv_l_ci)
-
-    ### Level 3: Node × Feature heatmap
-    n_nf = n_sub * len(FEATURES)
-    if n_nf <= GRAPHSHAP_MAX_NF_PLAYERS:
-        print(f"\n[L3] Node×Feature blocks ({n_nf} players, MC Shapley, LOCAL subgraph) …")
-
-        nf_blocks_global = make_node_feature_blocks(
-            sub_nodes_g,
-            FEATURES,
-            target_node_idx_g,
-            LOOKBACK
-        )
-        nf_blocks_local = remap_any_blocks_to_local(
-            nf_blocks_global,
-            global_to_local,
-            label=f"L3 node-feature blocks ({tgt_name})"
-        )
-
-        check_block_indices(
-            nf_blocks_local,
-            n_nodes=n_sub,
-            lookback=LOOKBACK,
-            n_features=len(FEATURES),
-            label=f"L3 node-feature blocks ({tgt_name})"
-        )
-
-        sv_nf_mean, sv_nf_std, sv_nf_ci = mc_shapley_over_blocks(
-            model=model,
-            edge_index=edge_index_sub_g,
-            X_TNF=X_TNF_sub,
-            test_indices=test_indices,
-            dates=dates,
-            player_blocks=nf_blocks_local,
-            sub_nodes_global=np.arange(n_sub, dtype=np.int64),
-            target_node_idx=target_sub_idx_g,
-            lookback=LOOKBACK,
-            n_features=len(FEATURES),
-            n_background=GRAPHSHAP_N_BACKGROUND,
-            n_explain=GRAPHSHAP_N_EXPLAIN,
-            n_mc_perms=GRAPHSHAP_N_MC_NF,
-            target_output=tgt_out,
-            device=str(device),
-            background_indices=train_indices,
-            season_window_days=GRAPHSHAP_SEASON_DAYS,
-            seed=20,
-        )
-
-        nf_names = [b[0] for b in nf_blocks_local]
-        plot_graphshap_bars(
-            sv_nf_mean,
-            sv_nf_ci,
-            nf_names,
-            title=f"Node×Feature Graph-SHAP  |  {tgt_name}  |  COMID {TARGET_COMID_FOR_PLOTS}",
-            save_path=os.path.join(OUTPUTS_DIR, f"graphshap_L3_nf_{tgt_name}_{TARGET_COMID_FOR_PLOTS}.png"),
-        )
-
-        plot_node_feature_heatmap(
-            sv_nf_mean,
-            nf_blocks_local,
-            np.arange(n_sub, dtype=np.int64),
-            FEATURES,
-            target_sub_idx_g,
-            {i: idx_to_comid[local_to_global[i]] for i in range(n_sub)},
-            title=f"Node×Feature Shapley Heatmap  |  {tgt_name}  |  COMID {TARGET_COMID_FOR_PLOTS}",
-            save_path=os.path.join(OUTPUTS_DIR, f"graphshap_L3_heatmap_{tgt_name}_{TARGET_COMID_FOR_PLOTS}.png"),
-        )
-
-        np.save(os.path.join(SAVE_DIR, f"graphshap_L3_nf_{tgt_name}_mean.npy"), sv_nf_mean)
-        np.save(os.path.join(SAVE_DIR, f"graphshap_L3_nf_{tgt_name}_ci95.npy"), sv_nf_ci)
-
-    else:
-        print(f"\n[L3] Skipped: {n_nf} players exceeds GRAPHSHAP_MAX_NF_PLAYERS={GRAPHSHAP_MAX_NF_PLAYERS}. "
-              f"Reduce GRAPHSHAP_N_HOPS or increase the limit.")
-
-    ### Structural Graph-SHAP on FULL graph
-    print(f"\n[Structural] MC Shapley over incoming edges ({tgt_name}) …")
-    sv_e_mean, sv_e_std, sv_e_ci, edge_players = compute_structural_graphshap_mc(
-        model=model,
-        edge_index=edge_index,
-        X_TNF=X_TNF,
-        test_indices=test_indices,
-        target_node_idx=target_node_idx_g,
-        lookback=LOOKBACK,
-        n_explain=GRAPHSHAP_N_EXPLAIN,
-        n_mc_perms=GRAPHSHAP_N_MC_STRUCT,
-        target_output=tgt_out,
-        device=str(device),
-        seed=30,
-    )
-
-    if len(sv_e_mean) > 0:
-        edge_names = [f"{idx_to_comid.get(s, s)} → {idx_to_comid.get(d, d)}"
-                      for s, d in edge_players]
-
-        plot_graphshap_bars(
-            sv_e_mean,
-            sv_e_ci,
-            edge_names,
-            title=f"Structural Graph-SHAP  |  {tgt_name}  |  COMID {TARGET_COMID_FOR_PLOTS}",
-            xlabel="Mean Shapley value: edge contribution (signed)",
-            save_path=os.path.join(OUTPUTS_DIR, f"graphshap_structural_{tgt_name}_{TARGET_COMID_FOR_PLOTS}.png"),
-        )
-
-        np.save(os.path.join(SAVE_DIR, f"graphshap_structural_{tgt_name}_mean.npy"), sv_e_mean)
-        np.save(os.path.join(SAVE_DIR, f"graphshap_structural_{tgt_name}_ci95.npy"), sv_e_ci)
-
-        sample_x, *_ = next(iter(test_loader))
-        sample_x = sample_x.squeeze(0).float()
-        ablation, bl = compute_edge_ablation_importance(
-            model,
-            edge_index,
-            sample_x,
-            target_node_idx_g,
-            tgt_out,
-            str(device)
-        )
-        print(f"  Ablation baseline ({tgt_name}): {bl:.6f}")
-        for (s, d), v in sorted(ablation.items(), key=lambda x: -abs(x[1])):
-            mc_idx = edge_players.index((s, d)) if (s, d) in edge_players else -1
-            mc_val = sv_e_mean[mc_idx] if mc_idx >= 0 else float("nan")
-            print(f"    {idx_to_comid.get(s,s)} → {idx_to_comid.get(d,d)}"
-                  f"  ablation={v:+.5f}  MC-Shapley={mc_val:+.5f}")
-
-print(f"\nAll Graph-SHAP outputs saved to: {SAVE_DIR}")
+#### Graph-SHAP is intentionally NOT run here. Explaining a trained graph
+#### model (feature / temporal / node×feature / structural Shapley) is a
+#### separate pass from training, and is moved out to GraphSHAP.py so that
+#### training runs aren't slowed down by SHAP's Monte Carlo permutations.
+#### Run SRC/GraphSHAP.py after this script finishes, once a model is saved
+#### to SAVE_DIR, to interpret it.
