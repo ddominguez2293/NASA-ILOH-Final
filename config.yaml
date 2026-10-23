@@ -22,8 +22,10 @@ hucs:
 
 ## 2. Time window
 #### Shared by the USGS pulls and the ERA5 pull
+#### end_date extended through the full 2026 calendar year-to-date for the
+#### final confirmatory pipeline run (not used for interim screening models).
 start_date: "1984-01-01"
-end_date: "2026-04-01"
+end_date: "2026-10-23"
 
 ## 3. Network / sites
 ### Stream-order floor for the flowlines, catchments and Q/T kept for modeling
