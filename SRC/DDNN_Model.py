@@ -59,6 +59,9 @@ from torch_geometric.nn import GATConv
 ### Sklearn
 from sklearn.preprocessing import MinMaxScaler
 
+### Shared graph-construction helpers (also used by GraphSHAP.py)
+from graph_utils import build_edge_pairs_from_nodes, build_coarsened_edges, edge_qa_checks
+
 
 ## 2. Configuration
 
@@ -496,101 +499,10 @@ def scaler_feature_diagnostic(scaler: MinMaxScaler, FEATURES: list, max_lines=40
         j = FEATURES.index(f)
         print(f"{f:>10s} | train_min={mins[j]:.6g}  train_max={maxs[j]:.6g}")
 
-### Build upstream -> downstream COMID edge pairs from fromnode / tonode
-def build_edge_pairs_from_nodes(edges_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Construct upstream->downstream COMID edges by joining on node ids:
-      (comid_up, tonode) matches (comid_dn, fromnode)
-    Returns edge_pairs_all with columns [comid_up, comid_dn] (deduped).
-    """
-    edges_df = edges_df.dropna(subset=["fromnode", "tonode", "comid"]).copy()
-    up = edges_df[["comid", "fromnode", "tonode"]].rename(columns={"comid": "comid_up"})
-    dn = edges_df[["comid", "fromnode", "tonode"]].rename(columns={"comid": "comid_dn"})
-
-    edge_pairs_all = (
-        up.merge(dn, left_on="tonode", right_on="fromnode", how="inner")[["comid_up", "comid_dn"]]
-          .drop_duplicates()
-          .reset_index(drop=True)
-    )
-    return edge_pairs_all
-
-### Coarsen the network to edges between observed COMIDs
-def build_coarsened_edges(edge_pairs_all: pd.DataFrame, observed_comids: set,
-                          max_hops=5000, mode="nearest") -> pd.DataFrame:
-    """
-    Collapse the full COMID network down to edges between observed COMIDs only.
-
-    For each observed COMID, walk downstream through the full graph until you hit another
-    observed COMID. Add an edge (src_observed -> downstream_observed).
-      mode="nearest": stop at first encountered observed downstream node.
-    """
-    dn_map = {}
-    for u, v in edge_pairs_all[["comid_up", "comid_dn"]].itertuples(index=False):
-        try:
-            u_i = int(u); v_i = int(v)
-        except Exception:
-            continue
-        dn_map.setdefault(u_i, []).append(v_i)
-
-    coarse_edges = set()
-
-    for src in observed_comids:
-        src = int(src)
-        seen = {src}
-        frontier = [src]
-        hops = 0
-
-        while frontier and hops < max_hops:
-            curr = frontier.pop()
-
-            for dn in dn_map.get(curr, []):
-                if dn in seen:
-                    continue
-                seen.add(dn)
-
-                if dn in observed_comids and dn != src:
-                    coarse_edges.add((src, dn))
-                    if mode == "nearest":
-                        frontier = []
-                        break
-                else:
-                    frontier.append(dn)
-
-            hops += 1
-
-    return pd.DataFrame(list(coarse_edges), columns=["comid_up", "comid_dn"])
-
-### Edge QA checks
-def edge_qa_checks(edge_pairs: pd.DataFrame, all_comids: np.ndarray) -> None:
-    """Lightweight QA checks for edge health."""
-    print("\n====================")
-    print("EDGE QA CHECKS")
-    print("====================")
-
-    n_nodes = len(all_comids)
-    n_edges = len(edge_pairs)
-
-    print(f"Nodes in modeling set: {n_nodes}")
-    print(f"Edges after filtering/coarsening: {n_edges}")
-    print(f"Edge density: {n_edges / max(n_nodes,1):.4f} edges/node")
-
-    if n_edges == 0:
-        print("WARNING: No edges in graph. Model will fail because it requires edge_index.")
-        return
-
-    self_loops = int((edge_pairs["comid_up"].astype(int) == edge_pairs["comid_dn"].astype(int)).sum())
-    dup_edges = int(edge_pairs.duplicated(subset=["comid_up", "comid_dn"]).sum())
-
-    nodes_up = set(edge_pairs["comid_up"].astype(int).unique())
-    nodes_dn = set(edge_pairs["comid_dn"].astype(int).unique())
-    nodes_any = nodes_up | nodes_dn
-
-    print(f"Nodes as upstream:   {len(nodes_up)} ({100*len(nodes_up)/n_nodes:.2f}%)")
-    print(f"Nodes as downstream: {len(nodes_dn)} ({100*len(nodes_dn)/n_nodes:.2f}%)")
-    print(f"Nodes in any edge:   {len(nodes_any)} ({100*len(nodes_any)/n_nodes:.2f}%)")
-    print(f"Self-loops: {self_loops}")
-    print(f"Duplicate edges: {dup_edges}")
-    print("EDGE QA DONE.")
+### Edge construction, coarsening, and QA now live in graph_utils.py
+#### (imported in Section 1) so DDNN_Model.py and GraphSHAP.py always share
+#### the identical implementation rather than two hand-synchronized copies —
+#### that duplication is exactly how they drifted out of sync (GitHub #10A).
 
 ### High-flow residual weights (computed in scaled Q space)
 def _q_highflow_weights_from_scaled(q_true_scaled: torch.Tensor,
@@ -663,6 +575,13 @@ assert T_COL in nodes_df_raw.columns, f"{T_COL} missing"
 
 nodes_df_raw["date"] = pd.to_datetime(nodes_df_raw["date"])
 nodes_df_raw = nodes_df_raw.sort_values(["date", "comid"]).reset_index(drop=True)
+
+### Replace -9998 sentinels with NaN in the targets before any repair, QC,
+#### or mask is computed (GitHub issue #4, point 1). Q/T sentinels happened
+#### to get caught incidentally by the negative-Q floor and the temperature
+#### plausibility range below, but that was a coincidence of those
+#### thresholds, not a guarantee -- do it explicitly instead.
+nodes_df_raw = replace_sentinel_with_nan(nodes_df_raw, [Q_COL, T_COL])
 
 ### Pre-QC range check
 #### Inspect raw target distributions before any repair or scaling
@@ -746,7 +665,7 @@ print("Remaining stream orders:", sorted(nodes_df_raw["streamorde"].dropna().uni
 #### exact scaler alignment used during training.
 FEATURES = BASE_FEATURES + SEASONAL_FEATURES + STATIC_FEATURES
 
-required_cols = {"comid", "date", Q_COL, T_COL, "temp_avail_raw", "q_avail_raw"} | set(FEATURES)
+required_cols = {"comid", "date", Q_COL, T_COL, "temp_avail_raw", "q_avail_raw", "q_avail_measured"} | set(FEATURES)
 missing_cols = [c for c in sorted(required_cols) if c not in nodes_df_raw.columns]
 if missing_cols:
     raise ValueError("Missing required columns in nodes_df_raw:\n" + "\n".join(missing_cols))
@@ -767,7 +686,7 @@ if SAVE_MODEL:
     joblib.dump(FEATURES, FEATURES_PATH)
     print(f"Saved FEATURES to: {FEATURES_PATH}")
 
-keep_cols = ["comid", "date"] + FEATURES + TARGETS + ["temp_avail_raw", "q_avail_raw"]
+keep_cols = ["comid", "date"] + FEATURES + TARGETS + ["temp_avail_raw", "q_avail_raw", "q_avail_measured"]
 nodes_df = nodes_df_raw[keep_cols].copy()
 
 ### Replace -9998 sentinels with NaN
@@ -844,9 +763,16 @@ if edge_index.numel() == 0:
 
 ## 6. Feature scaling
 #### MinMaxScaler is fit on training rows only to prevent data leakage.
-#### NaN values are temporarily filled with 0 for scaler mechanics; actual
-#### supervision is gated by the pre-computed availability masks so those
-#### filled values never act as true training signal.
+#### NaNs are left in place for fit/transform rather than zero-filled first
+#### (sklearn's MinMaxScaler ignores NaN via nanmin/nanmax when fitting, and
+#### propagates NaN through transform) -- fixes GitHub issue #5: zero-filling
+#### before fit was artificially pulling data_min_ toward 0 for naturally
+#### positive variables (e.g. a COMID with no catchment match would
+#### contribute an area_m2=0 "observation" into the fit, even though 0 was
+#### never actually measured). Missing *features* are filled in Section 7
+#### after scaling (so the fill value is the training-min in scaled space,
+#### not an arbitrary raw-space zero); missing *targets* are left as NaN and
+#### excluded from the loss/eval entirely via the observation masks (#4).
 
 ### Optional log1p transform of discharge (training option)
 #### Applied to nodes_df in physical units, before scaler_y is fit, so the
@@ -865,8 +791,8 @@ if train_mask_rows.sum() == 0:
 
 scaler_X = MinMaxScaler()
 scaler_y = MinMaxScaler()
-fit_X = np.nan_to_num(nodes_df.loc[train_mask_rows, FEATURES].values, nan=0.0)
-fit_y = np.nan_to_num(nodes_df.loc[train_mask_rows, TARGETS].values, nan=0.0)
+fit_X = nodes_df.loc[train_mask_rows, FEATURES].values
+fit_y = nodes_df.loc[train_mask_rows, TARGETS].values
 
 scaler_X.fit(fit_X)
 scaler_y.fit(fit_y)
@@ -876,11 +802,16 @@ if hasattr(scaler_X, "n_features_in_") and scaler_X.n_features_in_ != len(FEATUR
 
 scaler_feature_diagnostic(scaler_X, FEATURES, max_lines=40)
 
-### Transform all rows using train-fitted scalers
-X_all = np.nan_to_num(nodes_df[FEATURES].values, nan=0.0)
-Y_all = np.nan_to_num(nodes_df[TARGETS].values, nan=0.0)
+### Transform all rows using train-fitted scalers (NaN in -> NaN out)
+X_all = nodes_df[FEATURES].values
+Y_all = nodes_df[TARGETS].values
 nodes_df[FEATURES] = scaler_X.transform(X_all)
 nodes_df[TARGETS]  = scaler_y.transform(Y_all)
+
+### Missing *features* are filled only now, in scaled space, so a missing
+#### value lands at this feature's training-minimum rather than an
+#### arbitrary absolute zero that may not be a realistic value for it.
+nodes_df[FEATURES] = nodes_df[FEATURES].fillna(0.0)
 
 ### Precompute scaled threshold for high-flow Q weighting
 q_idx = TARGETS.index(Q_COL)
@@ -925,9 +856,14 @@ X_TNF[t_idx_arr, n_idx_arr, :] = nodes_df[FEATURES].to_numpy(dtype=np.float32)
 Y_TN2[t_idx_arr, n_idx_arr, 0] = nodes_df[Q_COL].to_numpy(dtype=np.float32)
 Y_TN2[t_idx_arr, n_idx_arr, 1] = nodes_df[T_COL].to_numpy(dtype=np.float32)
 
-# masks come from raw availability columns (not scaled)
+# Masks gate training supervision, validation loss, early stopping, and all
+# final Q/T metrics (GitHub issue #4). Qmask_TN uses q_avail_measured, not
+# q_avail_raw, so Q values filled by interpolation are never treated as real
+# observations anywhere downstream -- only genuinely measured, non-negative
+# Q counts as supervision/evaluation signal. Temperature has no
+# interpolation step, so temp_avail_raw is already measured-only.
 Tmask_TN[t_idx_arr, n_idx_arr] = nodes_df["temp_avail_raw"].to_numpy(dtype=bool)
-Qmask_TN[t_idx_arr, n_idx_arr] = nodes_df["q_avail_raw"].to_numpy(dtype=bool)
+Qmask_TN[t_idx_arr, n_idx_arr] = nodes_df["q_avail_measured"].to_numpy(dtype=bool)
 
 ## 8. Train–validation–test datasets
 #### Each sample is a LOOKBACK-day input window across all nodes ending at time t,

@@ -63,6 +63,9 @@ from torch_geometric.utils import k_hop_subgraph
 ### Sklearn
 import shap  # optional — retained for potential kernel-SHAP comparisons
 
+### Shared graph-construction helpers (also used by DDNN_Model.py)
+from graph_utils import build_edge_pairs_from_nodes, build_coarsened_edges, edge_qa_checks
+
 
 ## 2. Configuration
 
@@ -179,9 +182,11 @@ GRAPHSHAP_MAX_NF_PLAYERS = 100    # skip node×feature if larger
 GRAPHSHAP_SEASON_DAYS    = 45     # ±days for seasonal background
 
 
-## 3. Utility functions (data loading / graph construction)
+## 3. Utility functions (data loading)
 #### Duplicated from DDNN_Model.py — kept identical so the reconstructed
-#### domain and graph match the model being explained.
+#### domain matches the model being explained. Graph construction itself
+#### (build_edge_pairs_from_nodes, build_coarsened_edges, edge_qa_checks) is
+#### imported from graph_utils.py instead (see Section 1), not duplicated.
 
 SENTINEL_MISS = -9998.0
 
@@ -195,101 +200,10 @@ def replace_sentinel_with_nan(df: pd.DataFrame, cols):
             df.loc[x == SENTINEL_MISS, c] = np.nan
     return df
 
-### Build upstream -> downstream COMID edge pairs from fromnode / tonode
-def build_edge_pairs_from_nodes(edges_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Construct upstream->downstream COMID edges by joining on node ids:
-      (comid_up, tonode) matches (comid_dn, fromnode)
-    Returns edge_pairs_all with columns [comid_up, comid_dn] (deduped).
-    """
-    edges_df = edges_df.dropna(subset=["fromnode", "tonode", "comid"]).copy()
-    up = edges_df[["comid", "fromnode", "tonode"]].rename(columns={"comid": "comid_up"})
-    dn = edges_df[["comid", "fromnode", "tonode"]].rename(columns={"comid": "comid_dn"})
-
-    edge_pairs_all = (
-        up.merge(dn, left_on="tonode", right_on="fromnode", how="inner")[["comid_up", "comid_dn"]]
-          .drop_duplicates()
-          .reset_index(drop=True)
-    )
-    return edge_pairs_all
-
-### Coarsen the network to edges between observed COMIDs
-def build_coarsened_edges(edge_pairs_all: pd.DataFrame, observed_comids: set,
-                          max_hops=5000, mode="nearest") -> pd.DataFrame:
-    """
-    Collapse the full COMID network down to edges between observed COMIDs only.
-
-    For each observed COMID, walk downstream through the full graph until you hit another
-    observed COMID. Add an edge (src_observed -> downstream_observed).
-      mode="nearest": stop at first encountered observed downstream node.
-    """
-    dn_map = {}
-    for u, v in edge_pairs_all[["comid_up", "comid_dn"]].itertuples(index=False):
-        try:
-            u_i = int(u); v_i = int(v)
-        except Exception:
-            continue
-        dn_map.setdefault(u_i, []).append(v_i)
-
-    coarse_edges = set()
-
-    for src in observed_comids:
-        src = int(src)
-        seen = {src}
-        frontier = [src]
-        hops = 0
-
-        while frontier and hops < max_hops:
-            curr = frontier.pop()
-
-            for dn in dn_map.get(curr, []):
-                if dn in seen:
-                    continue
-                seen.add(dn)
-
-                if dn in observed_comids and dn != src:
-                    coarse_edges.add((src, dn))
-                    if mode == "nearest":
-                        frontier = []
-                        break
-                else:
-                    frontier.append(dn)
-
-            hops += 1
-
-    return pd.DataFrame(list(coarse_edges), columns=["comid_up", "comid_dn"])
-
-### Edge QA checks
-def edge_qa_checks(edge_pairs: pd.DataFrame, all_comids: np.ndarray) -> None:
-    """Lightweight QA checks for edge health."""
-    print("\n====================")
-    print("EDGE QA CHECKS")
-    print("====================")
-
-    n_nodes = len(all_comids)
-    n_edges = len(edge_pairs)
-
-    print(f"Nodes in modeling set: {n_nodes}")
-    print(f"Edges after filtering/coarsening: {n_edges}")
-    print(f"Edge density: {n_edges / max(n_nodes,1):.4f} edges/node")
-
-    if n_edges == 0:
-        print("WARNING: No edges in graph. Model will fail because it requires edge_index.")
-        return
-
-    self_loops = int((edge_pairs["comid_up"].astype(int) == edge_pairs["comid_dn"].astype(int)).sum())
-    dup_edges = int(edge_pairs.duplicated(subset=["comid_up", "comid_dn"]).sum())
-
-    nodes_up = set(edge_pairs["comid_up"].astype(int).unique())
-    nodes_dn = set(edge_pairs["comid_dn"].astype(int).unique())
-    nodes_any = nodes_up | nodes_dn
-
-    print(f"Nodes as upstream:   {len(nodes_up)} ({100*len(nodes_up)/n_nodes:.2f}%)")
-    print(f"Nodes as downstream: {len(nodes_dn)} ({100*len(nodes_dn)/n_nodes:.2f}%)")
-    print(f"Nodes in any edge:   {len(nodes_any)} ({100*len(nodes_any)/n_nodes:.2f}%)")
-    print(f"Self-loops: {self_loops}")
-    print(f"Duplicate edges: {dup_edges}")
-    print("EDGE QA DONE.")
+### Edge construction, coarsening, and QA now live in graph_utils.py
+#### (imported in Section 1), shared with DDNN_Model.py so the two scripts
+#### always reconstruct the identical graph topology -- that was the actual
+#### cause of the GitHub #10A drift, not just the traversal bug itself.
 
 
 ## 4. Load trained artifacts & rebuild the modeling domain
