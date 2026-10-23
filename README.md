@@ -8,25 +8,43 @@ This repository holds the data pipeline and model for the NASA Illinois–Ohio R
 
 ## Pipeline
 
-The scripts in `SRC/` form a single pipeline. Run them in the order below, from the repository root. Each step reads what the previous steps wrote to `data/` (which is not tracked by git).
+The whole pipeline is Python. Everything before the model is driven by [`config.yaml`](config.yaml): list one or more HUCs (any mix of HUC2 / HUC4 / HUC8), set the time window, and run
 
-| Step | Script | What it does | Main outputs |
+```
+python run_pipeline.py                         # steps 1-6, skipping any step that is already up to date
+python run_pipeline.py --config other.yaml     # a different HUC set / time window
+python run_pipeline.py --from-step catchments  # restart part-way through
+python run_pipeline.py --only meteo --force    # rebuild one step
+```
+
+Each AOI gets its own folder, `data/<aoi_name>/` (not tracked by git). Every step records the config it was built with, so changing the HUCs or dates rebuilds exactly the steps that depend on them instead of reusing stale files. The last step copies the two model inputs to `data/daily_drivers/`, where `DDNN_Model.py` reads them.
+
+| Step | Script | What it does | Main outputs (under `data/<aoi_name>/`) |
 |------|--------|--------------|--------------|
-| 1 | `Boundaries.py` | Downloads the Ohio River Basin (HUC2 `05`) and Illinois River Basin (HUC4 `0712` + `0713`, dissolved into one polygon) boundaries with `pynhd`. The Illinois basin is the area of interest used by every R step. | `data/shapes/*.shp` |
-| 2 | `Streamflow.Rmd` | Pulls daily USGS streamflow (parameter `00060`) for every site in the area of interest and converts it to m³/s. | `q_obs.parquet` |
-| 3 | `Temp.Rmd` | Pulls daily USGS water temperature (parameter `00010`), aggregates to one value per site and date, and joins it to the streamflow table. | `q_t.parquet` |
-| 4 | `Catchments.Rmd` | Downloads NHDPlus HR (HU4 `0712` + `0713`), snaps every Q/T site to a flowline COMID, builds one upstream basin per catchment locally, and keeps stream order ≥ 4. | `flowlines.gpkg`, `catchments.gpkg`, `site_upstream_basins.gpkg`, `sites_with_comid.csv`, `q_t_comid.parquet` |
-| 5 | `Meteo.Rmd` | Downloads daily GridMET drivers (`pr`, `tmmx`, `tmmn`, `srad`, `vs`, `vpd`, `sph`, `rmin`, `rmax`) and extracts them to each catchment with `exactextractr`. Basin-scale drivers are the area-weighted mean of the upstream catchment values. Temperatures are converted from K to °C. | `drivers_daily_joined.parquet` |
-| 6 | `PET.Rmd` | Computes extraterrestrial radiation and Hargreaves potential evapotranspiration at catchment and basin scale (`PET`, `bsn_PET`), and adds day-of-year sine/cosine terms. | `drivers_daily.parquet` |
-| 7 | `Q_Processing_python.py` | Joins the Q/T observations to the drivers by `comid` and `date`, attaches static catchment and flowline attributes (area, slope, length, stream order), builds the routing edge list, and splits the data by date (pre-2013 analysis set; 2013+ train/validation set restricted to stream order ≥ 5). Uses `polars` so the large tables can be handled. | `nodes.parquet`, `edge_list.parquet`, `hydro_temp_data_analysis_pre2013.parquet`, `hydro_temp_data_trainval_2013plus.parquet` |
-| 8 | `DDNN_Model.py` | **The model.** Trains and evaluates the multitask graph model (see below). Run from the terminal with CLI flags so repeat experiments don't require editing the file. | per-run folder under `outputs/`: `results.txt` (test variables + final metrics), `test_metrics_by_streamorder.csv`, diagnostic plots; model weights/scalers/features are only written to `SAVE_DIR` if `--save-model` is passed |
-| 9 | `GraphSHAP.py` | Explains a trained model with Graph-SHAP (feature, temporal, node×feature, and structural levels). Reloads the weights/scalers/features saved by `DDNN_Model.py --save-model` rather than training anything itself — run it once you've settled on a config and want to interpret that model. | Graph-SHAP figures and `.npy` arrays in `OUTPUTS_DIR` / `SAVE_DIR` |
+| 1 | `Boundaries.py` | Downloads the WBD boundary for every configured HUC with `pynhd`, dissolves them into one AOI, and resolves the NHDPlus HR HU4s to download (HUC2 → child HU4s, HUC8 → parent HU4). Drops HUCs nested in another configured HUC and warns if the AOI is not contiguous. | `shapes/aoi.gpkg`, `shapes/hu4s.json` |
+| 2 | `Streamflow.py` | Pulls daily-mean USGS streamflow (`00060`) for every site inside the AOI (Water Data API via `dataretrieval`) and converts it to m³/s. | `observations/q_obs.parquet` |
+| 3 | `Temp.py` | Pulls daily-mean USGS water temperature (`00010`) inside the AOI, averages sensors to one value per site and date, and full-joins it to streamflow. | `observations/q_t.parquet` |
+| 4 | `Catchments.py` | Reads NHDPlus HR for each HU4 (zips cached in `data/_nhdplushr/`), builds the routed network for **all** stream orders, snaps every Q/T site to the nearest flowline within 250 m (EPSG:5070), and writes the stream order ≥ `streamorder_min` model domain. Checks accumulated area against NHDPlus `TotDASqKm` and warns when a reach is fed from outside the AOI (an upstream HUC is missing from the config). | `nhdplus/network.parquet`, `nhdplus/catchments_all.gpkg`, `nhdplus/flowlines.gpkg`, `nhdplus/catchments.gpkg`, `observations/q_t_comid.parquet` |
+| 5 | `Meteo.py` | Downloads ERA5-Land for the AOI (see below) and builds the daily drivers `pr`, `srad`, `vs`, `vpd`, `sph`, `rmin`, `rmax`, `tmax_c`, `tmin_c`, `tmean_c` and `PET` for every model catchment, plus `bsn_*` versions (area-weighted mean over the whole upstream basin) and `Ra`, `DOY_sin`, `DOY_cos`. | `daily_drivers/drivers_daily/<year>.parquet` |
+| 6 | `Q_Processing_python.py` | Joins the Q/T observations to the drivers by `comid` and `date`, attaches static attributes (local area `area_m2`, total upstream drainage area `tot_area_m2`, slope, length, stream order), builds the edge list, and splits by date (before `analysis_cut_date` = analysis set; after = train/validation set with stream order ≥ `trainval_streamorder_min`). | `daily_drivers/edge_list.parquet`, `daily_drivers/hydro_temp_data_*.parquet`, copied to `data/daily_drivers/` |
+| 7 | `DDNN_Model.py` | **The model.** Trains and evaluates the multitask graph model (see below). Run from the terminal with CLI flags so repeat experiments don't require editing the file. | per-run folder under `outputs/`: `results.txt` (test variables + final metrics), `test_metrics_by_streamorder.csv`, diagnostic plots; model weights/scalers/features are only written to `SAVE_DIR` if `--save-model` is passed |
+| 8 | `GraphSHAP.py` | Explains a trained model with Graph-SHAP (feature, temporal, node×feature, and structural levels). Reloads the weights/scalers/features saved by `DDNN_Model.py --save-model` rather than training anything itself — run it once you've settled on a config and want to interpret that model. | Graph-SHAP figures and `.npy` arrays in `OUTPUTS_DIR` / `SAVE_DIR` |
 
-`Functions_Paths.R` is not a pipeline step. It centralizes the directory layout, loads the R package stack, and defines the helper functions shared by the R scripts (each one starts with `source("SRC/Functions_Paths.R")`).
+`pipeline_utils.py` is not a pipeline step. It loads and validates `config.yaml`, defines the `data/<aoi_name>/` layout, the up-to-date stamps, the USGS download helper, and the network routing shared by `Catchments.py` and `Meteo.py`.
+
+### Meteorology (ERA5-Land)
+
+- **Source:** hourly ERA5-Land (0.1°, about 9 km), aggregated to US Central (UTC−6) local days.
+  - Temperature, dewpoint, pressure and wind come from the ERA5-Land **point time-series** product: one request per grid cell that touches a catchment returns the whole period with all variables together, and is reduced to daily values as it arrives (`meteo/era5_raw/<key>/points/`). The Illinois basin needs 926 cells, about 2–3 hours.
+  - Precipitation, solar radiation and potential evaporation come from gridded hourly ERA5-Land, one request per year at 00 and 06 UTC only; ERA5-Land accumulations reset at 00 UTC, so those two fields give the exact local-day total.
+- **Why not the gridded or daily products for temperature / wind:** tested on 2026-10-22/23. The CDS runs only about one request per user at a time and refuses gridded hourly requests longer than a month, so 1984–2026 would take about a week; the daily-statistics product refused a year of daily means, queued each accepted request 2–3.5 h, and drops accumulated variables altogether. Both remain available (`era5.instant_source: hourly` or `daily`), and the point and gridded hourly routes give identical daily values (checked to float precision on 2023).
+- **Derived drivers:** `tmax_c` / `tmin_c` are the hourly max / min (`tmean_c` = their average, as before); `rmin` / `rmax` are the hourly min / max relative humidity; `vpd`, `sph` and `vs` are daily means of the hourly values; `PET` is ERA5-Land potential evaporation (mm/day, ≥ 0); `Ra` uses the FAO-56 formula from the former `PET.Rmd`.
+- **Catchment values** use each catchment's exact grid-cell coverage (`exactextract`), restricted to land cells. **Basin values (`bsn_*`)** are the area-weighted mean over every upstream catchment of every stream order. Two routings are computed and each reach keeps the one whose accumulated area is closer to NHDPlus `TotDASqKm` (`basin_routing` in `network.parquet`): *main* follows the NHDPlus main path (no area is lost where an HR braid dead-ends, which drops ~11,000 km² from the Illinois mainstem under the other rule), and *split* follows the node topology and divides flow equally at divergences (so side channels inherit the upstream basin). Neither routing ever counts a catchment twice.
+- **CDS access:** needs a key in `~/.cdsapirc` and the ERA5-Land licence accepted on the CDS website. The CDS address comes from `era5.cds_url` in `config.yaml`. Downloads are cached in `data/<aoi_name>/meteo/era5_raw/`, so an interrupted run resumes where it stopped.
 
 ## Comment style
 
-Every script in `SRC/` is commented the same way, so the code reads like a markdown outline:
+Every script (and `config.yaml`) is commented the same way, so the code reads like a markdown outline:
 
 | Marker | Meaning |
 |--------|---------|
@@ -35,7 +53,7 @@ Every script in `SRC/` is commented the same way, so the code reads like a markd
 | `#### Note` | Why, assumptions, or caveats for that step |
 | `# inline` | A short single-line bit next to the code |
 
-Inside the R Markdown files these markers sit inside the code chunks, and each file opens with a short prose header (step number, purpose, inputs, end-state). `Python` and `R` scripts open with a header comment listing inputs and outputs. Only comments follow this convention; the code is not affected.
+Each script opens with a header comment giving its step number, purpose, inputs and outputs. Only comments follow this convention; the code is not affected.
 
 ## Model (`DDNN_Model.py`)
 
@@ -81,10 +99,9 @@ Explains a trained model with a three-level Monte Carlo Shapley framework (featu
 
 ## Setup notes
 
-- **Working directory:** the R scripts treat the current working directory as the project root, so run them from the repository root.
-- **Paths:** `Q_Processing_python.py`, `DDNN_Model.py`, and `GraphSHAP.py` all resolve their input/output paths (`NODES_PATH`, `EDGES_PATH`, `SAVE_DIR`, `OUTPUTS_DIR`) relative to the repository root automatically — no hand-editing needed on a different machine.
-- **Python:** `pip install -r requirements.txt` (pinned versions in `requirements-lock.txt`) installs `numpy`, `pandas`, `matplotlib`, `joblib`, `scikit-learn`, `torch`, `torch-geometric`, `shap`, `pyarrow`, and the rest of the pipeline's dependencies, plus `geopandas`/`pynhd`/`polars` for the earlier steps.
-- **R:** the package stack loaded in `Functions_Paths.R`, plus `climateR`, `terra`, `exactextractr`, and `data.table` for the meteorological step.
+- **Paths:** every script resolves its paths relative to the repository root, so they can be run from anywhere; nothing needs hand-editing on a different machine.
+- **Python:** `pip install -r requirements.txt` (pinned versions in `requirements-lock.txt`) installs the model stack (`numpy`, `pandas`, `torch`, `torch-geometric`, `shap`, ...) and the pipeline stack (`geopandas`, `pynhd`, `polars`, `exactextract`, `dataretrieval`, `cdsapi`, `xarray`, ...). R is no longer needed.
+- **Disk:** NHDPlus HR zips are about 0.25–0.4 GB per HU4; the driver tables for the full Illinois basin and 1984–2026 run to tens of GB.
 - **Data:** everything under `data/` is generated by the pipeline and is excluded from version control.
 
 ## Abbreviations
@@ -99,9 +116,11 @@ Glossary for anyone new to the project — hydrology, modeling, and pipeline ter
 | USGS / NWIS | U.S. Geological Survey / National Water Information System — source of streamflow and water temperature observations |
 | Q | Discharge (streamflow), in m³/s |
 | T | Water temperature, in °C |
-| GridMET | The gridded daily meteorological dataset used for weather drivers (precipitation, radiation, wind, humidity, etc.) |
-| PET | Potential evapotranspiration |
-| Ra | Extraterrestrial radiation (used in the Hargreaves PET calculation) |
+| ERA5-Land | ECMWF's land reanalysis (0.1°, hourly), the source of the meteorological drivers (precipitation, temperature, radiation, wind, humidity, PET) |
+| CDS | Copernicus Climate Data Store — where ERA5-Land is downloaded from |
+| AOI | Area of interest — the dissolved union of the HUCs in `config.yaml` |
+| PET | Potential evapotranspiration (ERA5-Land potential evaporation) |
+| Ra | Extraterrestrial radiation (top-of-atmosphere solar radiation, FAO-56) |
 | DOY | Day of year (used for the sine/cosine seasonal features) |
 | LSTM | Long Short-Term Memory — the recurrent layer that encodes each reach's time-series input |
 | GAT / GNN | Graph Attention (Network) layer / Graph Neural Network — propagates information along the routed river graph |

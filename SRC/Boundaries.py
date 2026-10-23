@@ -1,11 +1,16 @@
+#!/usr/bin/env python3
+
 # Boundaries.py
 # STEP 1 of the pipeline (first script; nothing runs before it).
 #
-# Purpose : download the Ohio (HUC2 05) and Illinois (HUC4 0712 + 0713) basin
-#           boundaries from the USGS WBD and save them as shapefiles.
-# Outputs : data/shapes/ohio_river_basin.shp
-#           data/shapes/illinois_river_basin.shp   <- AOI used by every R step
-#           data/shapes/ohio_illinois_basin.shp    (reference only)
+# Purpose : download the WBD boundary for every HUC listed in config.yaml (any mix of
+#           HUC2 / HUC4 / HUC8), dissolve them into one AOI, and record which HU4s
+#           NHDPlus HR has to be downloaded for (Catchments.py).
+# Inputs  : config.yaml (hucs, aoi_name)
+# Outputs : data/<aoi>/shapes/aoi.gpkg    layer "aoi"  (dissolved AOI, EPSG:4326) <- read by every later step
+#                                         layer "hucs" (one polygon per configured HUC)
+#           data/<aoi>/shapes/hu4s.json   (HU4 codes to download + the HUC8 clip list)
+#           data/<aoi>/shapes/aoi_map.png (quick-look map)
 #
 # Comment style used in every script:
 #   ## N. Section   = major section of the script
@@ -14,66 +19,119 @@
 #   # inline        = short single-line bits next to the code
 #
 ## 1. Imports
-#### geopandas is imported twice below (harmless); left as-is
+import argparse
+import json
+
 import geopandas as gpd
-from pynhd import WaterData
+import matplotlib
 import pandas as pd
-import os
-import geopandas as gpd
+from pynhd import WaterData
+
+matplotlib.use("Agg")  # no GUI window, so the step runs unattended
 import matplotlib.pyplot as plt
 
-## 2. Output folder
-### Create the shapes folder if it doesn't exist
-os.makedirs("data/shapes", exist_ok=True)
+from pipeline_utils import banner, config_fingerprint, get_paths, is_up_to_date, load_config, write_stamp
 
-## 3. Ohio River Basin (HUC2 = 05)
-### Pull the HUC2 boundary and save it
-#### wbd02 is the WaterData layer that holds HUC2 boundaries
-wbd_huc2 = WaterData("wbd02")
-ohio = wbd_huc2.byid("huc2", ["05"])
-ohio_path = "data/shapes/ohio_river_basin.shp"
-ohio.to_file(ohio_path)
+STEP = "boundaries"
+CONFIG_KEYS = ["aoi_name", "hucs"]
 
-## 4. Illinois River Basin (HUC4 = 0712 + 0713)
-### Pull both HUC4s, dissolve into one polygon and save it
-#### illinois_river_basin.shp is the AOI that every R step reads (basin_shp in Functions_Paths.R)
-wbd_huc4 = WaterData("wbd04")
-illinois_0712 = wbd_huc4.byid("huc4", ["0712"])
-illinois_0713 = wbd_huc4.byid("huc4", ["0713"])
-illinois = gpd.GeoDataFrame(pd.concat([illinois_0712, illinois_0713], ignore_index=True)).dissolve()
-illinois_path = "data/shapes/illinois_river_basin.shp"
-illinois.to_file(illinois_path)
+## 2. Config
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--config", default=None, help="path to config.yaml (default: repo root)")
+parser.add_argument("--force", action="store_true", help="rebuild even if outputs are up to date")
+args = parser.parse_args()
 
-## 5. Combined Ohio + Illinois
-### Merge both basins into one shapefile
-#### Reference only; no downstream step reads this file
-both = gpd.GeoDataFrame(pd.concat([ohio, illinois], ignore_index=True))
-both = both.dissolve()
-both_path = "data/shapes/ohio_illinois_basin.shp"
-both.to_file(both_path)
+cfg = load_config(args.config)
+paths = get_paths(cfg)
+banner("STEP 1 Boundaries", cfg)
 
-print("Saved Ohio, Illinois, and merged basin shapefiles in data/shapes")
+outputs = [paths.aoi_gpkg, paths.hu4_list]
+fingerprint = config_fingerprint(cfg, CONFIG_KEYS)
+if not args.force and is_up_to_date(paths, STEP, fingerprint, outputs):
+    print("Up to date, skipping (use --force to rebuild).")
+    raise SystemExit(0)
 
-## 6. Quick-look map
-### Load the saved shapefiles
-ohio = gpd.read_file("data/shapes/ohio_river_basin.shp")
-illinois = gpd.read_file("data/shapes/illinois_river_basin.shp")
+## 3. Drop nested HUCs
+### A HUC that sits inside another configured HUC adds nothing
+#### e.g. ["0712", "07120001"] -> keep "0712" only
+hucs = cfg["hucs"]
+nested = [h for h in hucs if any(h != o and h.startswith(o) for o in hucs)]
+if nested:
+    print(f"WARNING: dropping HUCs already covered by a broader HUC in the list: {nested}")
+hucs = [h for h in hucs if h not in nested]
 
-### Create a base plot
-fig, ax = plt.subplots(figsize=(8, 6))
+## 4. Download WBD polygons
+### One WaterData query per HUC level
+#### wbd02 / wbd04 / wbd08 are the WaterData layers that hold each level's boundaries
+LAYER = {2: ("wbd02", "huc2"), 4: ("wbd04", "huc4"), 8: ("wbd08", "huc8")}
 
-# Plot Ohio River Basin
-ohio.plot(ax=ax, color="lightblue", edgecolor="black", label="Ohio River Basin")
+parts = []
+for level, (layer, col) in LAYER.items():
+    codes = [h for h in hucs if len(h) == level]
+    if not codes:
+        continue
+    g = WaterData(layer).byid(col, codes)
+    found = set(g[col].astype(str))
+    absent = sorted(set(codes) - found)
+    if absent:
+        raise ValueError(f"WBD has no {col.upper()} for: {absent}")
+    g = g.rename(columns={col: "huc"})[["huc", "geometry"]]
+    g["huc_level"] = level
+    parts.append(g)
 
-# Plot Illinois River Basin
-illinois.plot(ax=ax, color="lightgreen", edgecolor="black", label="Illinois River Basin")
+hucs_gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=parts[0].crs).to_crs(4326)
 
-# Add labels, title, and legend
-plt.title("Ohio and Illinois River Basins")
-plt.xlabel("Longitude")
-plt.ylabel("Latitude")
-plt.legend()
-plt.grid(True)
+## 5. Resolve HU4s for the NHDPlus HR download
+### HUC4 -> itself, HUC8 -> its parent HU4, HUC2 -> every child HU4
+#### HUC8 entries are recorded separately so Catchments.py clips the HU4 network back to them
+hu4s = set()
+for h in hucs:
+    if len(h) in (4, 8):
+        hu4s.add(h[:4])
+    else:
+        children = WaterData("wbd04").byfilter(f"huc4 LIKE '{h}%'")
+        hu4s.update(children["huc4"].astype(str))
 
-# Show the plot
-plt.show()
+hu4s = sorted(hu4s)
+clip_huc8s = sorted(h for h in hucs if len(h) == 8)
+
+print(f"Configured HUCs : {hucs}")
+print(f"HU4s to download: {hu4s}")
+if clip_huc8s:
+    print(f"HUC8 clip list  : {clip_huc8s}")
+
+## 6. Dissolve into one AOI and save
+### aoi.gpkg layer "aoi" is the AOI every later step reads
+#### Area is reported in EPSG:5070 (equal-area, meters)
+aoi = hucs_gdf.dissolve()[["geometry"]].reset_index(drop=True)
+aoi["aoi_name"] = cfg["aoi_name"]
+aoi["hucs"] = ",".join(hucs)
+aoi["area_km2"] = aoi.to_crs(5070).area / 1e6
+
+if paths.aoi_gpkg.exists():
+    paths.aoi_gpkg.unlink()  # gpkg layers append otherwise
+aoi.to_file(paths.aoi_gpkg, layer="aoi", engine="pyogrio")
+hucs_gdf.to_file(paths.aoi_gpkg, layer="hucs", engine="pyogrio")
+
+paths.hu4_list.write_text(json.dumps({"hucs": hucs, "hu4s": hu4s, "clip_huc8s": clip_huc8s}, indent=2))
+
+### Sanity check: AOI should be a single (multi)polygon
+n_parts = len(aoi.geometry.iloc[0].geoms) if aoi.geom_type.iloc[0] == "MultiPolygon" else 1
+print(f"AOI area: {aoi['area_km2'].iloc[0]:,.0f} km^2 | polygon parts: {n_parts}")
+if n_parts > 1:
+    print("WARNING: AOI is not contiguous; the river network will be split into disconnected pieces.")
+print(f"AOI bounds (lon/lat): {[round(v, 3) for v in aoi.total_bounds]}")
+
+## 7. Quick-look map
+### Saved to PNG instead of shown, so the step never blocks
+fig, ax = plt.subplots(figsize=(7, 7))
+hucs_gdf.plot(ax=ax, column="huc", cmap="Pastel1", edgecolor="grey", legend=True)
+aoi.boundary.plot(ax=ax, color="black", linewidth=1)
+ax.set_title(f"AOI: {cfg['aoi_name']} ({', '.join(hucs)})")
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+fig.savefig(paths.shape_dir / "aoi_map.png", dpi=120, bbox_inches="tight")
+plt.close(fig)
+
+write_stamp(paths, STEP, fingerprint, outputs)
+print(f"Saved {paths.aoi_gpkg} and {paths.hu4_list}")

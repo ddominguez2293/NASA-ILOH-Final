@@ -1,6 +1,7 @@
-# NASA-ILOH DDNN model dependencies
-# Known-working versions from the original DDNN_ILOH environment.
+# NASA-ILOH dependencies (whole pipeline is Python: Boundaries.py -> GraphSHAP.py)
+# Known-working versions from the original DDNN_ILOH environment (see requirements-lock.txt).
 
+## Model / Graph-SHAP
 numpy==2.0.2
 pandas==2.3.3
 matplotlib==3.9.4
@@ -10,3 +11,27 @@ torch==2.8.0
 torch-geometric==2.6.1
 shap==0.49.1
 pyarrow
+
+## Pipeline config
+PyYAML==6.0.3
+
+## Spatial (Boundaries.py, Catchments.py, Meteo.py)
+geopandas==1.0.1
+pyogrio==0.11.1
+shapely==2.0.7
+pyproj==3.6.1
+pynhd==0.19.4
+rasterio==1.4.3
+rioxarray==0.15.0
+exactextract  # polygon x grid-cell coverage weights for the ERA5 extraction
+
+## Tables (Q_Processing_python.py)
+polars==1.36.1
+scipy==1.13.1
+
+## Data access
+requests==2.32.5
+dataretrieval  # USGS streamflow / water temperature (Streamflow.py, Temp.py)
+cdsapi  # ERA5-Land daily statistics from the Copernicus CDS (Meteo.py)
+xarray==2024.7.0
+netCDF4==1.7.2

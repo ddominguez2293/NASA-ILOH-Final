@@ -1,0 +1,93 @@
+# config.yaml
+# Single source of truth for the pre-model pipeline (Boundaries.py -> Q_Processing_python.py).
+# Every SRC/ step reads this file through SRC/pipeline_utils.py; nothing below is hard-coded in the scripts.
+#
+# Comment style used in every script:
+#   ## N. Section   = major section of the file
+#   ### Step        = what the next block does
+#   #### Note       = why / assumptions / caveats
+#   # inline        = short single-line bits
+
+## 1. Area of interest
+### Name used for the per-AOI data folder (data/<aoi_name>/)
+aoi_name: illinois_river_basin
+
+### HUCs to model
+#### Any mix of HUC2 / HUC4 / HUC8 codes (as strings). One code or many.
+#### NHDPlus HR downloads by HU4, so Boundaries.py resolves every code to its HU4s
+#### (HUC2 -> child HU4s, HUC8 -> parent HU4, clipped back to the HUC8 later)
+hucs:
+  - "0712"
+  - "0713"
+
+## 2. Time window
+#### Shared by the USGS pulls and the ERA5 pull
+start_date: "1984-01-01"
+end_date: "2026-04-01"
+
+## 3. Network / sites
+### Stream-order floor for the flowlines, catchments and Q/T kept for modeling
+#### Upstream basins are still built from the full (unfiltered) network
+streamorder_min: 4
+
+### Site snapping (EPSG:5070, meters)
+snap_crs: 5070
+snap_max_distance_m: 250
+
+## 4. ERA5-Land meteorology (Meteo.py)
+### CDS settings
+#### cds_url overrides the url in ~/.cdsapirc (the old cds-beta address no longer works); the key still comes from ~/.cdsapirc
+era5:
+  cds_url: https://cds.climate.copernicus.eu/api
+  workers: 8  # CDS requests submitted in parallel
+  utc_offset_hours: -6  # local day = US Central standard time, matches USGS daily values
+  bbox_buffer_deg: 0.2  # pad the AOI bbox so edge catchments get full cell coverage
+  hourly_dataset: reanalysis-era5-land
+  timeseries_dataset: reanalysis-era5-land-timeseries
+
+  ### Instantaneous variables (temperature, humidity, pressure, wind)
+  #### All three sources aggregate hourly ERA5-Land to local days the same way (true daily RH min / max, mean wind speed)
+  #### instant_source: timeseries -> one point request per grid cell for the whole period, all variables together.
+  ####                               Tested 2026-10-23: ~80-120 s per point and requests run in parallel,
+  ####                               so the Illinois basin (926 cells, 1984-2026) takes a few hours
+  ####                 hourly     -> gridded hourly ERA5-Land, one request per month (larger requests are refused).
+  ####                               CDS runs only ~1 request per user at a time: ~3 months / hour overnight,
+  ####                               i.e. about a week for 1984-2026
+  ####                 daily      -> CDS daily-statistics product: a year of daily means exceeds the cost limit and
+  ####                               each accepted request queued 2-3.5 h
+  instant_source: timeseries
+  instantaneous:
+    - 2m_temperature
+    - 2m_dewpoint_temperature
+    - surface_pressure
+    - 10m_u_component_of_wind
+    - 10m_v_component_of_wind
+
+  ### instant_source: daily settings (mean requested per month, max / min per year)
+  daily_dataset: derived-era5-land-daily-statistics
+  daily_mean:
+    - 2m_temperature
+    - 2m_dewpoint_temperature
+    - surface_pressure
+    - 10m_u_component_of_wind
+    - 10m_v_component_of_wind
+  daily_maximum:
+    - 2m_temperature
+  daily_minimum:
+    - 2m_temperature
+
+  ### Accumulated variables (precipitation, solar radiation, potential evaporation): hourly ERA5-Land, one request per year
+  #### The daily-statistics product silently drops accumulated variables, so these always come from the
+  #### hourly dataset at 00:00 and |utc_offset|:00 UTC only (two fields per day). ERA5-Land
+  #### accumulations reset at 00 UTC, so a local-day total is exact:
+  ####   total(D) = acc[D+1 00:00] - acc[D 06:00] + acc[D+1 06:00]
+  accumulated:
+    - total_precipitation
+    - surface_solar_radiation_downwards
+    - potential_evaporation
+
+## 5. Model input splits (Q_Processing_python.py)
+#### Output filenames stay fixed because DDNN_Model.py reads them by name
+analysis_cut_date: "2013-01-01"  # before = analysis set, on / after = train / validation set
+trainval_streamorder_min: 5
+model_split_date: "2025-01-01"  # diagnostic only; must match DDNN_Model.py
