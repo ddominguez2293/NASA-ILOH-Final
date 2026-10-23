@@ -1594,16 +1594,39 @@ with open(RESULTS_PATH, "a") as f:
 #### closing.  The histogram view applies the same preprocessing rules used
 #### during training so what you inspect matches what the model saw.
 #### The default target COMID may not fall inside every stream-order band
-#### tested here; fall back to an arbitrary in-domain COMID rather than
-#### losing the scatter/histogram plots (which don't depend on the target)
-#### over a single-reach hydrograph that can't be drawn for this domain.
-if TARGET_COMID_FOR_PLOTS not in comid_to_idx:
-    fallback_comid = int(all_comids[0])
-    print(f"\n[WARNING] COMID {TARGET_COMID_FOR_PLOTS} not in this run's domain "
+#### tested here, and — even when it is in-domain — picking an arbitrary
+#### (sorted-first) COMID almost always lands on an ungauged reach, since
+#### only a handful of COMIDs per stream order have real observations (see
+#### gauge_inventory.py). That silently produced an empty "Observed" line on
+#### every hydrograph. Fall back to a COMID with real test-period
+#### observations instead, preferring one gauged for both Q and T.
+q_gauged_by_node = q_masks.any(axis=0)     # [N] bool: any test-period Q obs
+t_gauged_by_node = temp_masks.any(axis=0)  # [N] bool: any test-period T obs
+
+requested_idx = comid_to_idx.get(TARGET_COMID_FOR_PLOTS)
+requested_is_gauged = requested_idx is not None and (q_gauged_by_node[requested_idx] or t_gauged_by_node[requested_idx])
+
+if not requested_is_gauged:
+    both_idx  = np.where(q_gauged_by_node & t_gauged_by_node)[0]
+    q_idx_opt = np.where(q_gauged_by_node)[0]
+    t_idx_opt = np.where(t_gauged_by_node)[0]
+
+    if len(both_idx) > 0:
+        fallback_idx = int(both_idx[0])
+    elif len(q_idx_opt) > 0:
+        fallback_idx = int(q_idx_opt[0])
+    elif len(t_idx_opt) > 0:
+        fallback_idx = int(t_idx_opt[0])
+    else:
+        fallback_idx = 0  # no gauged reach at all in this domain's test period
+
+    fallback_comid = int(all_comids[fallback_idx])
+    reason = "not in this run's domain" if requested_idx is None else "has no test-period observations"
+    print(f"\n[WARNING] COMID {TARGET_COMID_FOR_PLOTS} {reason} "
           f"(streamorde {STREAMORDER_MIN}-{STREAMORDER_MAX}); "
-          f"falling back to COMID {fallback_comid} for single-reach plots.")
+          f"falling back to gauged COMID {fallback_comid} for single-reach plots.")
     with open(RESULTS_PATH, "a") as f:
-        f.write(f"\n[WARNING] TARGET_COMID_FOR_PLOTS {TARGET_COMID_FOR_PLOTS} not in domain; "
+        f.write(f"\n[WARNING] TARGET_COMID_FOR_PLOTS {TARGET_COMID_FOR_PLOTS} {reason}; "
                 f"used fallback COMID {fallback_comid} for single-reach plots.\n")
     TARGET_COMID_FOR_PLOTS = fallback_comid
 

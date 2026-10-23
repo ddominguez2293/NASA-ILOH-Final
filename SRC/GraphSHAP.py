@@ -9,15 +9,21 @@
 #           Monte Carlo permutations — run this separately once a model exists.
 # Inputs  : hydro_temp_data_trainval_2013plus.parquet   (NODES_PATH)
 #           edge_list.parquet                           (EDGES_PATH)
+#           outputs/<run-name>/results.txt              (recorded run config)
 #           trained model weights, scaler_X.pkl, features.pkl in SAVE_DIR
-#           (all written by DDNN_Model.py)
+#           (all written by DDNN_Model.py --save-model)
 # Outputs : Graph-SHAP figures and .npy arrays, written to OUTPUTS_DIR / SAVE_DIR
+# Usage   : python SRC/GraphSHAP.py --run-name <run-name>
 #
-# Note    : the domain filter (STREAMORDER_MIN/MAX), USE_COARSENED_GRAPH
-#           settings, LOOKBACK, and model hyperparameters below must match
-#           whatever DDNN_Model.py run produced the artifacts in SAVE_DIR —
-#           they are duplicated here rather than imported because
-#           DDNN_Model.py is a top-level script, not a reusable module.
+# Note    : the domain filter, graph construction (coarsening/bidirectional),
+#           and architecture (GAT depth / LSTM-only) are loaded from
+#           outputs/<run-name>/results.txt at runtime (see _load_run_config
+#           in Section 2) rather than hand-copied into constants here — that
+#           hand-copying is what let this file drift out of sync with
+#           DDNN_Model.py every time a new experiment flag was added.
+#           DDNN_Model.py can't be imported directly (it's a CLI script that
+#           parses argv and runs training at import time), so results.txt is
+#           the shared contract between the two scripts instead.
 #
 # Comment style used in every script:
 #   ## N. Section   = major section of the script
@@ -37,6 +43,8 @@ Graph-SHAP over incoming edges, for a single target COMID.
 ## 1. Imports
 ### Standard library
 import os
+import re
+import argparse
 from pathlib import Path
 
 ### Scientific stack
@@ -58,32 +66,87 @@ import shap  # optional — retained for potential kernel-SHAP comparisons
 
 ## 2. Configuration
 
+### Which run to explain
+#### Everything below that describes the training run (domain, lookback,
+#### graph construction, architecture) is loaded from that run's
+#### outputs/<run-name>/results.txt rather than hand-copied into constants
+#### here — hand-copied constants are exactly what let this file drift out
+#### of sync with DDNN_Model.py every time a new experiment flag was added
+#### (graph coarsening, bidirectional edges, GAT depth, LSTM-only mode).
+#### Only run this against a run that was trained with --save-model, since
+#### that's what writes the .pth/scaler/features artifacts this script loads.
+parser = argparse.ArgumentParser(description="Graph-SHAP interpretation for a trained DDNN_Model.py run.")
+parser.add_argument("--run-name", type=str, required=True,
+                     help="outputs/<run-name> folder of the training run to explain "
+                          "(must have been trained with --save-model)")
+parser.add_argument("--target-comid", type=int, default=None,
+                     help="COMID to explain; defaults to the run's TARGET_COMID_FOR_PLOTS")
+args = parser.parse_args()
+
 ### Input data paths — same inputs DDNN_Model.py reads.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 NODES_PATH = PROJECT_ROOT / "data" / "daily_drivers" / "hydro_temp_data_trainval_2013plus.parquet"
 EDGES_PATH = PROJECT_ROOT / "data" / "daily_drivers" / "edge_list.parquet"
 
-### Temporal split & sequence — must match the training run being explained.
-SPLIT_DATE = pd.Timestamp("2025-01-01")
-LOOKBACK   = 30                             # days of antecedent input per window
+
+### Parse the training run's recorded config out of its results.txt
+#### Only the "=== Test variables ===" block is needed here (plain KEY: value
+#### lines); metric sections below it use a different format and are ignored.
+def _load_run_config(run_name: str) -> dict:
+    results_path = PROJECT_ROOT / "outputs" / run_name / "results.txt"
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"No results.txt for run '{run_name}' at {results_path}. "
+            "GraphSHAP.py needs the training run's recorded config to reconstruct "
+            "the same domain/graph/architecture — pass the exact --run-name used in DDNN_Model.py."
+        )
+    kv = {}
+    kv_re = re.compile(r"^([A-Z][A-Z0-9_]*):\s*(.*)$")
+    with open(results_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("===") and "Test variables" not in line and kv:
+                break  # stop once we've left the test-variables block
+            m = kv_re.match(line)
+            if m:
+                kv[m.group(1)] = m.group(2)
+    return kv
+
+
+def _as_bool(s, default):
+    if s is None:
+        return default
+    return s.strip().lower() in ("true", "1", "yes")
+
+
+RUN_CONFIG = _load_run_config(args.run_name)
+
+### Temporal split & sequence — loaded from the training run's config.
+SPLIT_DATE = pd.Timestamp(RUN_CONFIG.get("SPLIT_DATE", "2025-01-01"))
+LOOKBACK   = int(RUN_CONFIG.get("LOOKBACK", 30))
 
 ### Model hyperparameters — must match the architecture of the saved weights,
 #### since load_state_dict requires identical layer shapes.
-H_LSTM       = 64
-LSTM_LAYERS  = 1
-LSTM_DROPOUT = 0.2
+H_LSTM       = int(RUN_CONFIG.get("H_LSTM", 64))
+LSTM_LAYERS  = int(RUN_CONFIG.get("LSTM_LAYERS", 1))
+LSTM_DROPOUT = float(RUN_CONFIG.get("LSTM_DROPOUT", 0.2))
 
-H_GNN        = 64
-GNN_DROPOUT  = 0.2
-GAT_HEADS    = 4
+H_GNN        = int(RUN_CONFIG.get("H_GNN", 64))
+GNN_DROPOUT  = float(RUN_CONFIG.get("GNN_DROPOUT", 0.2))
+GAT_HEADS    = int(RUN_CONFIG.get("GAT_HEADS", 4))
+
+### Graph attention depth / ablation — defaults match DDNN_Model.py's
+#### pre-ablation behavior, for results.txt files written before these flags existed.
+USE_GAT      = _as_bool(RUN_CONFIG.get("USE_GAT"), True)
+N_GAT_LAYERS = int(RUN_CONFIG.get("N_GAT_LAYERS", 2))
 
 ### Modeling domain — must match the stream-order band used for training.
-STREAMORDER_MIN = 8
-STREAMORDER_MAX = 9
+STREAMORDER_MIN = int(RUN_CONFIG.get("STREAMORDER_MIN", 8))
+STREAMORDER_MAX = int(RUN_CONFIG.get("STREAMORDER_MAX", 9))
 
 ### Target COMID for this explanation pass.
-TARGET_COMID_FOR_PLOTS = 14787569
+TARGET_COMID_FOR_PLOTS = args.target_comid or int(RUN_CONFIG.get("TARGET_COMID_FOR_PLOTS", 14787569))
 
 ### Trained-artifact + output paths.
 SAVE_DIR    = PROJECT_ROOT / "data" / "models"
@@ -92,10 +155,16 @@ FEATURES_PATH  = os.path.join(SAVE_DIR, "features.pkl")
 SCALER_X_PATH  = os.path.join(SAVE_DIR, "scaler_X.pkl")
 MODEL_FILENAME = "graph_lstm_gat_multitask_q_t_maskedloss_sigmoid_head.pth"
 
-### Graph coarsening — must match the training run's settings.
-USE_COARSENED_GRAPH = True
-MAX_HOPS_COARSEN    = 5000
-COARSE_MODE         = "nearest"
+### Graph coarsening / bidirectionality — must match the training run's settings.
+USE_COARSENED_GRAPH  = _as_bool(RUN_CONFIG.get("USE_COARSENED_GRAPH"), True)
+MAX_HOPS_COARSEN     = int(RUN_CONFIG.get("MAX_HOPS_COARSEN", 5000))
+COARSE_MODE          = RUN_CONFIG.get("COARSE_MODE", "nearest")
+BIDIRECTIONAL_EDGES  = _as_bool(RUN_CONFIG.get("BIDIRECTIONAL_EDGES"), False)
+
+print(f"Explaining run: {args.run_name}")
+print(f"Loaded config: SO{STREAMORDER_MIN}-{STREAMORDER_MAX}, lookback={LOOKBACK}, "
+      f"use_gat={USE_GAT}, n_gat_layers={N_GAT_LAYERS}, coarsened={USE_COARSENED_GRAPH}, "
+      f"bidirectional={BIDIRECTIONAL_EDGES}")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -283,6 +352,12 @@ else:
         edge_pairs_all["comid_up"].isin(all_comids) & edge_pairs_all["comid_dn"].isin(all_comids)
     ].drop_duplicates().reset_index(drop=True)
 
+### Optional bidirectional edges — must match the training run (G06-style).
+if BIDIRECTIONAL_EDGES and len(edge_pairs) > 0:
+    reversed_pairs = edge_pairs.rename(columns={"comid_up": "comid_dn", "comid_dn": "comid_up"})
+    edge_pairs = pd.concat([edge_pairs, reversed_pairs], ignore_index=True).drop_duplicates().reset_index(drop=True)
+    print(f"[BidirectionalEdges] Added reverse edges: {len(edge_pairs)} total directed edges.")
+
 if len(edge_pairs) > 0:
     src = edge_pairs["comid_up"].map(comid_to_idx).to_numpy()
     dst = edge_pairs["comid_dn"].map(comid_to_idx).to_numpy()
@@ -345,8 +420,10 @@ print(f"\n{len(train_indices)} training-period windows; {len(test_indices)} test
 
 class GraphLSTM_MTL(nn.Module):
     def __init__(self, in_dim, lstm_hidden, lstm_layers, lstm_dropout,
-                 gnn_hidden, gnn_dropout, heads=4, out_dim=2):
+                 gnn_hidden, gnn_dropout, heads=4, out_dim=2,
+                 use_gat=True, n_gat_layers=2):
         super().__init__()
+        self.use_gat = use_gat
         self.lstm = nn.LSTM(
             input_size=in_dim,
             hidden_size=lstm_hidden,
@@ -355,19 +432,30 @@ class GraphLSTM_MTL(nn.Module):
             batch_first=True
         )
         self.drop_lstm = nn.Dropout(lstm_dropout)
-        self.gat1 = GATConv(lstm_hidden, gnn_hidden // heads, heads=heads, dropout=gnn_dropout)
-        self.gat2 = GATConv(gnn_hidden, gnn_hidden // heads, heads=heads, dropout=gnn_dropout)
         self.drop_gnn = nn.Dropout(gnn_dropout)
-        self.head = nn.Linear(gnn_hidden, out_dim)
+
+        if use_gat:
+            assert n_gat_layers >= 1, "n_gat_layers must be >= 1 when use_gat=True"
+            gat_in = lstm_hidden
+            gat_layers = []
+            for _ in range(n_gat_layers):
+                gat_layers.append(GATConv(gat_in, gnn_hidden // heads, heads=heads, dropout=gnn_dropout))
+                gat_in = gnn_hidden
+            self.gat_layers = nn.ModuleList(gat_layers)
+            head_in = gnn_hidden
+        else:
+            self.gat_layers = nn.ModuleList()
+            head_in = lstm_hidden
+
+        self.head = nn.Linear(head_in, out_dim)
 
     def forward(self, x_win, edge_index, return_logits=False):
         lstm_out, _ = self.lstm(x_win)                   # [N, lb, H_LSTM]
-        node_embed = self.drop_lstm(lstm_out[:, -1, :]) # [N, H_LSTM]
+        h = self.drop_lstm(lstm_out[:, -1, :])            # [N, H_LSTM]
 
-        h = F.elu(self.gat1(node_embed, edge_index))    # [N, H_GNN]
-        h = self.drop_gnn(h)
-        h = F.elu(self.gat2(h, edge_index))             # [N, H_GNN]
-        h = self.drop_gnn(h)
+        for gat in self.gat_layers:
+            h = F.elu(gat(h, edge_index))                 # [N, H_GNN]
+            h = self.drop_gnn(h)
 
         raw = self.head(h)                              # [N, 2] unconstrained logits
         # return_logits=True avoids sigmoid saturation: near 0/1, individual
@@ -379,7 +467,8 @@ class GraphLSTM_MTL(nn.Module):
 model = GraphLSTM_MTL(
     in_dim=len(FEATURES),
     lstm_hidden=H_LSTM, lstm_layers=LSTM_LAYERS, lstm_dropout=LSTM_DROPOUT,
-    gnn_hidden=H_GNN, gnn_dropout=GNN_DROPOUT, heads=GAT_HEADS, out_dim=2
+    gnn_hidden=H_GNN, gnn_dropout=GNN_DROPOUT, heads=GAT_HEADS, out_dim=2,
+    use_gat=USE_GAT, n_gat_layers=N_GAT_LAYERS,
 ).to(device)
 
 model.load_state_dict(torch.load(os.path.join(SAVE_DIR, MODEL_FILENAME), map_location=device))
