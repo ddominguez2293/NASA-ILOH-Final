@@ -1433,8 +1433,11 @@ with open(RESULTS_PATH, "a") as f:
 MIN_OBS_PER_COMID = 10  # too few points makes NSE/variance unstable to the point of meaningless
 
 per_comid_rows = []
+HAS_TOT_AREA = "tot_area_m2" in nodes_df_raw.columns  # cumulative upstream drainage area;
+                                                       # absent in pre-pipeline-rerun data
+static_cols = ["comid", "area_m2", "streamorde"] + (["tot_area_m2"] if HAS_TOT_AREA else [])
 raw_statics_by_comid = (
-    nodes_df_raw[["comid", "area_m2", "streamorde"]]
+    nodes_df_raw[static_cols]
     .drop_duplicates("comid")
     .set_index("comid")
 )
@@ -1444,9 +1447,11 @@ for j, comid in enumerate(all_comids):
     if comid in raw_statics_by_comid.index:
         row["area_m2"] = float(raw_statics_by_comid.loc[comid, "area_m2"])
         row["streamorde"] = raw_statics_by_comid.loc[comid, "streamorde"]
+        row["tot_area_m2"] = float(raw_statics_by_comid.loc[comid, "tot_area_m2"]) if HAS_TOT_AREA else np.nan
     else:
         row["area_m2"] = np.nan
         row["streamorde"] = np.nan
+        row["tot_area_m2"] = np.nan
 
     q_series_mask = q_masks[:, j] & np.isfinite(obs_phys[:, j, 0]) & np.isfinite(pred_phys[:, j, 0])
     n_q = int(q_series_mask.sum())
@@ -1483,17 +1488,27 @@ n_gauges_q_eligible = int(per_comid_df["Q_NSE"].notna().sum())
 n_gauges_t_eligible = int(per_comid_df["T_NSE"].notna().sum())
 
 ### Quick directional read on drainage area vs. per-reach Q skill (full
-#### scatter is in per_comid_diagnostics.csv for plotting).
-_area_nse = per_comid_df[["area_m2", "Q_NSE"]].dropna()
-if len(_area_nse) >= 3:
-    area_nse_corr = float(np.corrcoef(np.log1p(_area_nse["area_m2"]), _area_nse["Q_NSE"])[0, 1])
-else:
-    area_nse_corr = np.nan
+#### scatter is in per_comid_diagnostics.csv for plotting). Checks both
+#### local catchment area (area_m2) and, once available, cumulative
+#### upstream contributing drainage area (tot_area_m2) -- the hypothesis
+#### was specifically that *cumulative* area explains per-reach skill
+#### better than local area, since it's the physically relevant quantity
+#### for discharge magnitude.
+def _log1p_corr(df, area_col, nse_col="Q_NSE"):
+    sub = df[[area_col, nse_col]].dropna()
+    if len(sub) < 3:
+        return np.nan
+    return float(np.corrcoef(np.log1p(sub[area_col]), sub[nse_col])[0, 1])
+
+area_nse_corr = _log1p_corr(per_comid_df, "area_m2")
+tot_area_nse_corr = _log1p_corr(per_comid_df, "tot_area_m2") if HAS_TOT_AREA else np.nan
 
 print(f"\n=== Per-reach (per-COMID) diagnostics, test period (>= {MIN_OBS_PER_COMID} obs required) ===")
 print(f"Q median per-gauge NSE: {q_median_pergauge_nse:.4f}  ({n_gauges_q_eligible} eligible gauges)")
 print(f"T median per-gauge NSE: {t_median_pergauge_nse:.4f}  ({n_gauges_t_eligible} eligible gauges)")
 print(f"corr(log1p(area_m2), Q_NSE) across eligible gauges: {area_nse_corr:.4f}")
+if HAS_TOT_AREA:
+    print(f"corr(log1p(tot_area_m2), Q_NSE) across eligible gauges: {tot_area_nse_corr:.4f}")
 print(f"Full per-reach table written to: per_comid_diagnostics.csv")
 
 ### Seasonal Q/T skill (pooled across reaches, by meteorological season)
@@ -1525,6 +1540,8 @@ with open(RESULTS_PATH, "a") as f:
     f.write(f"N_GAUGES_Q_ELIGIBLE: {n_gauges_q_eligible}\n")
     f.write(f"N_GAUGES_T_ELIGIBLE: {n_gauges_t_eligible}\n")
     f.write(f"AREA_LOG1P_VS_Q_NSE_CORR: {area_nse_corr:.4f}\n")
+    if HAS_TOT_AREA:
+        f.write(f"TOT_AREA_LOG1P_VS_Q_NSE_CORR: {tot_area_nse_corr:.4f}\n")
     f.write("(full per-reach table: per_comid_diagnostics.csv)\n")
 
     f.write("\n=== Test Metrics by Season ===\n")

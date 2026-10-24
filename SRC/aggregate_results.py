@@ -145,7 +145,7 @@ def main():
         "N_REACHES_WITH_Q_TEST", "N_REACHES_WITH_T_TEST",
         "Q_N_ANY_TEST", "Q_N_MEASURED_TEST", "Q_N_INTERPOLATED_TEST", "T_N_MEASURED_TEST",
         "Q_MEDIAN_PERGAUGE_NSE", "T_MEDIAN_PERGAUGE_NSE",
-        "N_GAUGES_Q_ELIGIBLE", "N_GAUGES_T_ELIGIBLE", "AREA_LOG1P_VS_Q_NSE_CORR",
+        "N_GAUGES_Q_ELIGIBLE", "N_GAUGES_T_ELIGIBLE", "AREA_LOG1P_VS_Q_NSE_CORR", "TOT_AREA_LOG1P_VS_Q_NSE_CORR",
     ]
     ordered_cols = [c for c in priority_cols if c in comparison_df.columns]
     remaining_cols = [c for c in comparison_df.columns if c not in ordered_cols]
