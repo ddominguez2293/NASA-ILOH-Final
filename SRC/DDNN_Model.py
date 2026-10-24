@@ -193,19 +193,27 @@ STREAMORDER_MIN = args.streamorder_min
 STREAMORDER_MAX = args.streamorder_max
 
 ### Feature groups
-#### Meteorological drivers from GridMET: precipitation, radiation, wind, vapor
-#### pressure, humidity, and basin-averaged precip. Temperature variables were
-#### converted from Kelvin to °C; mean daily temp is derived from tmax/tmin.
-#### PET (represented via Ra) captures atmospheric water demand beyond precip alone.
+#### Meteorological drivers from ERA5-Land: precipitation, radiation, wind,
+#### vapor pressure, humidity, and basin-averaged precip. Temperature
+#### variables were converted from Kelvin to °C; mean daily temp is derived
+#### from tmax/tmin. Ra (extraterrestrial radiation) and the ERA5-derived
+#### PET (actual potential evapotranspiration, basin-averaged as bsn_PET)
+#### both capture atmospheric water demand beyond precip alone -- added
+#### alongside Ra rather than replacing it, since they carry complementary
+#### information (PET is the direct physical quantity; Ra is a simpler proxy).
 BASE_FEATURES = [
     "pr", "srad", "vs", "vpd", "sph",
     "tmax_c", "tmin_c", "tmean_c",
-    "rmin", "rmax", "Ra", "bsn_pr"
+    "rmin", "rmax", "Ra", "bsn_pr",
+    "PET", "bsn_PET",
 ]
 
 ### Static catchment attributes
-#### Fixed per COMID, constant through time.
-STATIC_FEATURES = ["area_m2", "Slope", "LengthKM", "streamorde"]
+#### Fixed per COMID, constant through time. tot_area_m2 is cumulative
+#### upstream contributing drainage area (vs. area_m2's local/incremental
+#### catchment area) -- added once the corrected pipeline started producing
+#### it, to give the model watershed-scale context that area_m2 alone can't.
+STATIC_FEATURES = ["area_m2", "tot_area_m2", "Slope", "LengthKM", "streamorde"]
 
 ### Seasonal features
 #### Sine/cosine encoding of day-of-year: preserves the cyclical annual structure
