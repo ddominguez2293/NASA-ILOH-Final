@@ -22,10 +22,13 @@ hucs:
 
 ## 2. Time window
 #### Shared by the USGS pulls and the ERA5 pull
-#### end_date extended through the full 2026 calendar year-to-date for the
-#### final confirmatory pipeline run (not used for interim screening models).
+#### end_date extended through 2026 year-to-date for the final confirmatory
+#### pipeline run, pulled back from "today" to respect ERA5-Land's publish
+#### latency: a 2026-10-23 run found 2026-10-17 (6 days back) still had only
+#### 18/24 hours published, so every point-series request failed identically
+#### on the same incomplete tail day. 2026-10-13 gives ~10 days of margin.
 start_date: "1984-01-01"
-end_date: "2026-10-23"
+end_date: "2026-10-13"
 
 ## 3. Network / sites
 ### Stream-order floor for the flowlines, catchments and Q/T kept for modeling
