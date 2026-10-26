@@ -44,6 +44,7 @@ import pygridmet as gridmet
 import pyarrow as pa
 import pyarrow.parquet as pq
 import xarray as xr
+from shapely.geometry import box
 
 from pipeline_utils import (banner, catchment_basin_weights, config_fingerprint, get_paths, is_up_to_date,
                             load_config, ra_mm, read_aoi, require_files, write_stamp)
@@ -101,6 +102,105 @@ w, s, e, n = aoi.total_bounds
 bbox = (float(w - buf), float(s - buf), float(e + buf), float(n + buf))
 print(f"GridMET request bbox [W, S, E, N]: {bbox}")
 
+### Network and catchments loaded here (not in Section 6, as in Meteo.py) because the download
+#### step below needs them too, to skip tiles with no catchments before ever requesting them.
+net = pd.read_parquet(paths.network)
+cat = gpd.read_file(paths.catchments_all, engine="pyogrio").to_crs(4326)
+cat_sindex = cat.sindex
+
+### GridMET's THREDDS endpoint caps the grid cells per single request -- tested 2026-10-26:
+#### ~8,640 cells OK, ~9,350+ cells fails, independent of the years/variables requested together
+#### (a half-AOI bbox with 10 variables x 5 years succeeded). Tile the bbox so each piece stays
+#### well under that, then merge the tiles back into one Dataset per chunk.
+GRIDMET_RES = 1 / 24  # native ~4km grid spacing (degrees), for sizing tiles only
+TARGET_CELLS_PER_TILE = 4000
+
+
+def tile_bbox(bbox, target_cells, res):
+    w, s, e, n = bbox
+    total_cells = ((e - w) / res) * ((n - s) / res)
+    side = max(1, int(np.ceil(np.sqrt(total_cells / target_cells))))
+    lons = np.linspace(w, e, side + 1)
+    lats = np.linspace(s, n, side + 1)
+    return [(lons[i], lats[j], lons[i + 1], lats[j + 1]) for i in range(side) for j in range(side)]
+
+
+MIN_TILE_CELLS = 20  # give up subdividing a stubborn tile below this size
+
+
+def _has_catchments(tb):
+    return len(cat_sindex.query(box(*tb), predicate="intersects")) > 0
+
+
+def _fetch_leaves(tb, years_list, variables, out):
+    #### GridMET's service errors out entirely (rather than returning NaN) for a request whose
+    #### bbox is pure or mostly open water -- confirmed 2026-10-26 for a Lake Michigan-adjacent
+    #### tile at the AOI bbox's NE corner. Passing the exact watershed polygon instead of its bbox
+    #### doesn't avoid this either: pygridmet derives a bbox from the polygon internally and
+    #### requests that, so a request clipped to just 32% real land still failed the same way.
+    #### The fix: on failure, split the tile into quadrants and retry each -- the water-only
+    #### remainder eventually becomes small enough to have zero catchments and gets skipped outright
+    #### (via cat's spatial index) before being requested again, while the land-containing piece
+    #### keeps shrinking until it succeeds on its own. Successful leaves are appended to `out`
+    #### rather than merged here -- combine_by_coords cannot reliably infer concat order once
+    #### tiles are missing in an irregular (non-hypercube) pattern, which an all-water tile
+    #### guarantees; fetch_gridmet below assembles the full grid itself instead.
+    if not _has_catchments(tb):
+        return
+    try:
+        out.append(gridmet.get_bygeom(tb, years_list, variables=variables))
+    except Exception as exc:
+        w, s, e, n = tb
+        ncells = ((e - w) / GRIDMET_RES) * ((n - s) / GRIDMET_RES)
+        if ncells <= MIN_TILE_CELLS:
+            print(f"    tile {tb} failed at minimum size ({exc}); treating as no data", flush=True)
+            return
+        mid_lon, mid_lat = (w + e) / 2, (s + n) / 2
+        for q in [(w, s, mid_lon, mid_lat), (w, mid_lat, mid_lon, n),
+                  (mid_lon, s, e, mid_lat), (mid_lon, mid_lat, e, n)]:
+            _fetch_leaves(q, years_list, variables, out)
+
+
+def fetch_gridmet(bbox, years_list, variables):
+    #### Collect every successfully-fetched leaf (irregular sizes/positions, gaps where water-only
+    #### areas were skipped), then scatter each one into a single pre-allocated full-bbox grid by
+    #### index -- rather than asking combine_by_coords to infer the layout, which breaks as soon as
+    #### the leaves don't tile the bbox as a clean hypercube (exactly what a dropped tile causes).
+    leaves = []
+    for t in tile_bbox(bbox, TARGET_CELLS_PER_TILE, GRIDMET_RES):
+        _fetch_leaves(t, years_list, variables, leaves)
+    if not leaves:
+        raise RuntimeError("Every GridMET tile failed for this chunk")
+
+    w, s, e, n = bbox
+    #### Anchor on one leaf's cell: GridMET's grid is a single fixed global grid (same alignment
+    #### everywhere), so any leaf's lat/lon fixes the fractional offset for the whole bbox. Snap
+    #### the bbox edges outward to that alignment to get the full grid spanning it.
+    lat0 = float(leaves[0]["lat"].values[0])
+    lon0 = float(leaves[0]["lon"].values[0])
+    k_north = int(np.ceil((n - lat0) / GRIDMET_RES - 1e-6))
+    k_south = int(np.floor((s - lat0) / GRIDMET_RES + 1e-6))
+    lat_full = lat0 + GRIDMET_RES * np.arange(k_north, k_south - 1, -1)  # descending
+    k_west = int(np.floor((w - lon0) / GRIDMET_RES + 1e-6))
+    k_east = int(np.ceil((e - lon0) / GRIDMET_RES - 1e-6))
+    lon_full = lon0 + GRIDMET_RES * np.arange(k_west, k_east + 1)  # ascending
+    n_lat, n_lon = len(lat_full), len(lon_full)
+
+    time_vals = leaves[0]["time"].values
+    data = {v: np.full((len(time_vals), n_lat, n_lon), np.nan, dtype=np.float32) for v in variables}
+    for leaf in leaves:
+        lat_i = np.rint((lat_full[0] - leaf["lat"].values) / GRIDMET_RES).astype(int)
+        lon_i = np.rint((leaf["lon"].values - lon_full[0]) / GRIDMET_RES).astype(int)
+        if (lat_i.min() < 0 or lat_i.max() >= n_lat or lon_i.min() < 0 or lon_i.max() >= n_lon):
+            raise RuntimeError("A GridMET leaf's cells fall outside the computed full grid")
+        for v in variables:
+            data[v][:, lat_i.min():lat_i.max() + 1, lon_i.min():lon_i.max() + 1] = leaf[v].values
+
+    return xr.Dataset(
+        {v: (("time", "lat", "lon"), data[v]) for v in variables},
+        coords={"time": time_vals, "lat": lat_full, "lon": lon_full},
+    )
+
 
 ## 4. Download GridMET in chunks (cached as one NetCDF per chunk; public source, no API key)
 raw_dir = paths.gridmet_raw_dir
@@ -116,7 +216,7 @@ todo = [(y0, y1) for y0, y1 in chunks if not chunk_file(y0, y1).exists()]
 print(f"GridMET chunks ({chunk_years} yr each): {len(chunks) - len(todo)} cached, {len(todo)} to download")
 for y0, y1 in todo:
     print(f"  {y0}-{y1}: downloading...", flush=True)
-    ds = gridmet.get_bygeom(bbox, list(range(y0, y1 + 1)), variables=GM_VARS)
+    ds = fetch_gridmet(bbox, list(range(y0, y1 + 1)), GM_VARS)
     target = chunk_file(y0, y1)
     ds.to_netcdf(target.with_suffix(".part"))
     target.with_suffix(".part").rename(target)
@@ -142,8 +242,7 @@ print(f"Grid: {len(lat)} x {len(lon)} cells, {land.sum()} land")
 
 
 ## 6. Catchment and basin weights (shared with Meteo.py -- see pipeline_utils.catchment_basin_weights)
-net = pd.read_parquet(paths.network)
-cat = gpd.read_file(paths.catchments_all, engine="pyogrio").to_crs(4326)
+#### net / cat were already loaded in Section 3, for the tile pre-filter.
 model, model_comid, cat_row_model, W_model, Wb = catchment_basin_weights(lat, lon, land, net, cat)
 
 ### Latitude / longitude of each model catchment (for Ra and the output table)
