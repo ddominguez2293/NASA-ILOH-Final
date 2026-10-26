@@ -26,25 +26,36 @@ import sys
 import time
 from pathlib import Path
 
-## 2. Steps in order
 REPO_ROOT = Path(__file__).resolve().parent
-STEPS = [
-    ("boundaries", "Boundaries.py"),
-    ("streamflow", "Streamflow.py"),
-    ("temp", "Temp.py"),
-    ("catchments", "Catchments.py"),
-    ("meteo", "Meteo.py"),
-    ("q_processing", "Q_Processing_python.py"),
-]
-NAMES = [s for s, _ in STEPS]
+sys.path.insert(0, str(REPO_ROOT / "SRC"))
+from pipeline_utils import load_config  # noqa: E402
 
-## 3. Arguments
+## 2. Arguments
+NAMES = ["boundaries", "streamflow", "temp", "catchments", "meteo", "q_processing"]
 parser = argparse.ArgumentParser(description="Run the pre-model pipeline")
 parser.add_argument("--config", default=None, help="path to config.yaml (default: repo root)")
 parser.add_argument("--from-step", choices=NAMES, help="start at this step")
 parser.add_argument("--only", choices=NAMES, nargs="+", help="run only these steps")
 parser.add_argument("--force", action="store_true", help="rebuild the selected steps even if up to date")
 args = parser.parse_args()
+
+## 3. Steps in order
+#### "meteo" dispatches to Meteo_gridmet.py or Meteo.py depending on config.yaml's met_source
+#### (gridmet by default); both write identical output columns, so nothing downstream changes.
+met_source = load_config(args.config).get("met_source", "gridmet")
+if met_source not in ("gridmet", "era5"):
+    raise ValueError(f"config.yaml met_source must be 'gridmet' or 'era5', got {met_source!r}")
+meteo_script = "Meteo_gridmet.py" if met_source == "gridmet" else "Meteo.py"
+print(f"Meteorology source: {met_source} ({meteo_script})")
+
+STEPS = [
+    ("boundaries", "Boundaries.py"),
+    ("streamflow", "Streamflow.py"),
+    ("temp", "Temp.py"),
+    ("catchments", "Catchments.py"),
+    ("meteo", meteo_script),
+    ("q_processing", "Q_Processing_python.py"),
+]
 
 selected = STEPS
 if args.from_step:

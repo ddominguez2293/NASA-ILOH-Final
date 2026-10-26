@@ -32,6 +32,7 @@ scipy==1.13.1
 ## Data access
 requests==2.32.5
 dataretrieval  # USGS streamflow / water temperature (Streamflow.py, Temp.py)
-cdsapi  # ERA5-Land daily statistics from the Copernicus CDS (Meteo.py)
+cdsapi  # ERA5-Land daily statistics from the Copernicus CDS (Meteo.py, met_source: era5)
+pygridmet==0.19.4  # GridMET from the public THREDDS source, no API key (Meteo_gridmet.py, met_source: gridmet)
 xarray==2024.7.0
 netCDF4==1.7.2

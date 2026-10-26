@@ -91,6 +91,22 @@ era5:
     - surface_solar_radiation_downwards
     - potential_evaporation
 
+## 4b. Meteorology source selection
+#### "gridmet" (default) or "era5" -- determines which script run_pipeline.py runs for the "meteo"
+#### step (Meteo_gridmet.py or Meteo.py); both write identical output columns, so nothing downstream
+#### needs to change either way. Switched the default to gridmet after a 2026-10 investigation: ERA5-Land
+#### (~9km grid) looked like a substantial contributor to a discharge-NSE drop relative to the original
+#### GridMET-trained reference model, and GridMET's native ~4km grid matches that original setup.
+met_source: gridmet
+
+## 4c. GridMET meteorology (Meteo_gridmet.py)
+#### Public THREDDS source (climatologylab.org/gridmet.html) via pygridmet -- no API key and no request
+#### queue, unlike CDS/ERA5-Land. GridMET's native variables map directly to the model's driver columns
+#### (pr, srad, vs, sph, rmin, rmax, vpd, tmmx/tmmn, pet); no hourly reconstruction needed.
+gridmet:
+  bbox_buffer_deg: 0.1  # pad the AOI bbox so edge catchments get full cell coverage
+  chunk_years: 5  # years per cached raw download; smaller survives interruptions better, larger is fewer requests
+
 ## 5. Model input splits (Q_Processing_python.py)
 #### Output filenames stay fixed because DDNN_Model.py reads them by name
 analysis_cut_date: "2013-01-01"  # before = analysis set, on / after = train / validation set
