@@ -142,6 +142,10 @@ parser.add_argument("--bidirectional-edges", action="store_true", default=False,
                      help="add the reverse (downstream->upstream) edge for every "
                           "upstream->downstream edge, so attention can also propagate "
                           "downstream context toward smaller tributaries (G06)")
+parser.add_argument("--exclude-pet", action="store_true", default=False,
+                     help="drop PET/bsn_PET from BASE_FEATURES, to test whether the "
+                          "ERA5-derived PET addition is helping, hurting, or neutral "
+                          "relative to Ra alone")
 args = parser.parse_args()
 
 ### Input data paths
@@ -205,8 +209,9 @@ BASE_FEATURES = [
     "pr", "srad", "vs", "vpd", "sph",
     "tmax_c", "tmin_c", "tmean_c",
     "rmin", "rmax", "Ra", "bsn_pr",
-    "PET", "bsn_PET",
 ]
+if not args.exclude_pet:
+    BASE_FEATURES = BASE_FEATURES + ["PET", "bsn_PET"]
 
 ### Static catchment attributes
 #### Fixed per COMID, constant through time. tot_area_m2 is cumulative
@@ -300,6 +305,7 @@ RUN_NAME = args.run_name or (
     f"{'' if _is_default_smooth else f'_lambdaSmooth{LAMBDA_SMOOTH:g}'}"
     f"{'_directEdges' if args.use_direct_edges else ''}"
     f"{'_bidir' if args.bidirectional_edges else ''}"
+    f"{'_noPET' if args.exclude_pet else ''}"
     f"{'_lstmOnly' if args.no_gat else (f'_gat{args.gat_layers}' if args.gat_layers != 2 else '')}"
     f"_seed{args.seed}_{RUN_TIMESTAMP}"
 )
@@ -361,6 +367,7 @@ with open(RESULTS_PATH, "w") as f:
         "COMMON_SO_MAX": args.common_so_max,
         "USE_LOG_SCALE_Q": USE_LOG_SCALE_Q,
         "INCLUDE_DOY": args.include_doy,
+        "EXCLUDE_PET": args.exclude_pet,
         "DOY_COMPONENT": args.doy_component,
         "Q_WEIGHT": Q_WEIGHT,
         "T_WEIGHT": T_WEIGHT,
