@@ -155,6 +155,10 @@ class Paths:
     def era5_raw_dir(self) -> Path:
         return self.meteo_dir / "era5_raw"
 
+    @property
+    def gridmet_raw_dir(self) -> Path:
+        return self.meteo_dir / "gridmet_raw"
+
 
 def get_paths(cfg: dict, create: bool = True) -> Paths:
     data_dir = REPO_ROOT / "data"
@@ -319,6 +323,129 @@ def _topological_order(n, up, dn):
     if len(order) != n:
         raise RuntimeError(f"Routing network has a loop ({n - len(order)} reaches unresolved)")
     return np.asarray(order, dtype=np.int64)
+
+
+## 7b. Catchment / basin weights from a regular lat-lon grid (Meteo.py, Meteo_gridmet.py)
+#### Shared so every meteorology source reconstructs the identical weighting -- this used to be
+#### copy-pasted per script, which is exactly the kind of drift that caused GitHub issue #10A
+#### for the model's graph construction. grid_res is inferred from the lon spacing rather than
+#### assumed, so this works for ERA5-Land's 0.1 deg grid and GridMET's ~0.0417 deg grid alike.
+def catchment_basin_weights(lat, lon, land, net, cat):
+    """
+    Build catchment-scale and whole-upstream-basin-scale weight matrices from a
+    regular meteorology grid.
+
+    lat, lon : 1D arrays, latitude descending / longitude ascending (grid cell centers)
+    land     : 2D bool array [len(lat), len(lon)], True where the grid has data
+    net      : network.parquet DataFrame (comid, areasqkm, in_model, hydroseq,
+               tonode, fromnode, tocomid, basin_routing, acc_areasqkm)
+    cat      : catchments_all.gpkg GeoDataFrame (comid, geometry), CRS 4326
+
+    Returns (model, model_comid, cat_row_model, W_model, Wb):
+      model         : positions into `net` that are model catchments
+      model_comid   : net["comid"] at those positions
+      cat_row_model : positions into `cat` for each model catchment (for centroid lon/lat)
+      W_model       : sparse [n_model x n_cells] catchment-scale weights, rows sum to 1
+      Wb            : sparse [n_model x n_cells] whole-upstream-basin weights, rows sum to 1
+    """
+    import numpy as np
+    import pandas as pd
+    from exactextract import exact_extract
+    from exactextract.raster import NumPyRasterSource
+    from scipy import sparse
+
+    ncell = land.size
+    res = float(abs(lon[1] - lon[0]))
+
+    ### Catchment weights: polygon x cell coverage (exactextract) x cell area (cos lat), land cells only
+    xmin, xmax = float(lon[0] - res / 2), float(lon[-1] + res / 2)
+    ymin, ymax = float(lat[-1] - res / 2), float(lat[0] + res / 2)
+    grid = NumPyRasterSource(np.ones(land.shape), xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
+    cov = exact_extract(grid, cat[["geometry"]].reset_index(drop=True), ["cell_id", "coverage"], output="pandas")
+
+    rows = np.repeat(np.arange(len(cat)), cov["cell_id"].map(len).to_numpy())
+    cols = np.concatenate(cov["cell_id"].to_numpy()).astype(np.int64)
+    vals = np.concatenate(cov["coverage"].to_numpy()).astype(np.float64)
+    cell_lat = np.repeat(lat, len(lon))
+    vals = vals * np.cos(np.deg2rad(cell_lat[cols]))
+    keep = land.ravel()[cols]
+    rows, cols, vals = rows[keep], cols[keep], vals[keep]
+
+    #### Catchments that only touch water cells (lake shore) fall back to the nearest land cell
+    covered = np.bincount(rows, weights=vals, minlength=len(cat)) > 0
+    if (~covered).any():
+        land_idx = np.flatnonzero(land.ravel())
+        land_xy = np.c_[np.tile(lon, len(lat))[land_idx], cell_lat[land_idx]]
+        cxy = cat.geometry.iloc[np.flatnonzero(~covered)].representative_point()
+        near = land_idx[np.argmin((cxy.x.to_numpy()[:, None] - land_xy[:, 0]) ** 2 +
+                                  (cxy.y.to_numpy()[:, None] - land_xy[:, 1]) ** 2, axis=1)]
+        rows = np.r_[rows, np.flatnonzero(~covered)]
+        cols = np.r_[cols, near]
+        vals = np.r_[vals, np.ones(len(near))]
+        print(f"  {int((~covered).sum())} catchments had no land cell; using the nearest land cell")
+
+    W_cat = sparse.csr_matrix((vals, (rows, cols)), shape=(len(cat), ncell))
+    W_cat = sparse.diags(1.0 / np.asarray(W_cat.sum(axis=1)).ravel()) @ W_cat  # rows sum to 1
+
+    ### Reorder to the network table (flowline-only reaches have no catchment -> empty row, area 0)
+    row_of = pd.Series(np.arange(len(cat)), index=cat["comid"].to_numpy())
+    net_row = row_of.reindex(net["comid"].to_numpy()).to_numpy()
+    has_cat = ~np.isnan(net_row)
+    pick = sparse.csr_matrix((np.ones(has_cat.sum()), (np.flatnonzero(has_cat), net_row[has_cat].astype(np.int64))),
+                             shape=(len(net), len(cat)))
+    W_net = (pick @ W_cat).tocsr()
+    area_net = np.where(has_cat, net["areasqkm"].to_numpy(), 0.0)
+
+    ### Model catchments: stream order >= min and a catchment polygon
+    model = np.flatnonzero(net["in_model"].to_numpy() & has_cat)
+    model_comid = net["comid"].to_numpy()[model]
+    cat_row_model = net_row[model].astype(np.int64)
+    W_model = W_net[model]
+    print(f"Model catchments: {len(model):,} (of {len(net):,} reaches in the network)")
+
+    ### Basin weights: area-weighted catchment weights accumulated down the network
+    #### bsn weight row i = sum over upstream catchments u of area_u * W_u, divided by the upstream area
+    #### Each model reach uses the routing Catchments.py chose for it (basin_routing: split or main)
+    #### Solved in blocks of grid cells so the dense right-hand side stays small
+    AW = (sparse.diags(area_net) @ W_net).tocsc()
+    used = np.flatnonzero(np.asarray(AW.sum(axis=0)).ravel() > 0)
+    Wb = np.zeros((len(model), ncell), dtype=np.float32)
+    routing = net["basin_routing"].to_numpy()[model]
+    block = 128
+    for name, make_links in ROUTINGS.items():
+        rows_r = np.flatnonzero(routing == name)
+        if not len(rows_r):
+            continue
+        solve = upstream_solver(net["comid"], net["hydroseq"], make_links(net))
+        for b0 in range(0, len(used), block):
+            cols_b = used[b0:b0 + block]
+            Wb[np.ix_(rows_r, cols_b)] = solve(AW[:, cols_b].toarray())[model[rows_r]]
+    up_area = Wb.sum(axis=1, dtype=np.float64)
+    if np.any(up_area <= 0):
+        raise RuntimeError("Some model catchments have zero upstream area")
+    #### Same routing as Catchments.py: each row's area must equal that reach's acc_areasqkm
+    mismatch = np.abs(up_area / net["acc_areasqkm"].to_numpy()[model] - 1)
+    if mismatch.max() > 1e-3:
+        raise RuntimeError(f"Basin weights disagree with network.parquet acc_areasqkm (max rel. diff {mismatch.max():.4f})")
+    Wb = sparse.csr_matrix(Wb / up_area[:, None].astype(np.float32))
+    Wb.data[Wb.data < 1e-9] = 0
+    Wb.eliminate_zeros()
+    print(f"Basin weights: {Wb.nnz:,} nonzeros "
+          f"(median {np.median(np.diff(Wb.indptr)):.0f} cells per basin, max {np.diff(Wb.indptr).max()})")
+
+    return model, model_comid, cat_row_model, W_model, Wb
+
+
+### Extraterrestrial radiation Ra (mm/day), FAO-56 -- same formula regardless of meteorology source
+def ra_mm(doy, lat_deg):
+    import numpy as np
+
+    phi = np.deg2rad(lat_deg)[None, :]
+    j = doy[:, None]
+    dr = 1 + 0.033 * np.cos(2 * np.pi / 365 * j)
+    dec = 0.409 * np.sin(2 * np.pi / 365 * j - 1.39)
+    ws = np.arccos(np.clip(-np.tan(phi) * np.tan(dec), -1, 1))
+    return 0.408 * (24 * 60 / np.pi) * 0.0820 * dr * (ws * np.sin(phi) * np.sin(dec) + np.cos(phi) * np.cos(dec) * np.sin(ws))
 
 
 ## 8. USGS daily values (Streamflow.py, Temp.py)

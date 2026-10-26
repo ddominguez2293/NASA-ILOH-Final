@@ -39,12 +39,9 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import xarray as xr
-from exactextract import exact_extract
-from exactextract.raster import NumPyRasterSource
-from scipy import sparse
 
-from pipeline_utils import (banner, config_fingerprint, get_paths, is_up_to_date, load_config, read_aoi,
-                            require_files, ROUTINGS, upstream_solver, write_stamp)
+from pipeline_utils import (banner, catchment_basin_weights, config_fingerprint, get_paths, is_up_to_date,
+                            load_config, ra_mm, read_aoi, require_files, write_stamp)
 
 STEP = "meteo"
 CONFIG_KEYS = ["aoi_name", "hucs", "start_date", "end_date", "streamorder_min", "era5"]
@@ -280,84 +277,10 @@ def hourly_to_daily(series):
     return out.astype({c: np.float32 for c in INSTANT})
 
 
-## 6. Catchment and basin weights
-### Catchment weights: polygon x cell coverage (exactextract) x cell area (cos lat), land cells only
+## 6. Catchment and basin weights (shared with Meteo_gridmet.py -- see pipeline_utils.catchment_basin_weights)
 net = pd.read_parquet(paths.network)
 cat = gpd.read_file(paths.catchments_all, engine="pyogrio").to_crs(4326)
-
-xmin, xmax = float(lon[0] - RES / 2), float(lon[-1] + RES / 2)
-ymin, ymax = float(lat[-1] - RES / 2), float(lat[0] + RES / 2)
-grid = NumPyRasterSource(np.ones(land.shape), xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
-cov = exact_extract(grid, cat[["geometry"]].reset_index(drop=True), ["cell_id", "coverage"], output="pandas")
-
-rows = np.repeat(np.arange(len(cat)), cov["cell_id"].map(len).to_numpy())
-cols = np.concatenate(cov["cell_id"].to_numpy()).astype(np.int64)
-vals = np.concatenate(cov["coverage"].to_numpy()).astype(np.float64)
-cell_lat = np.repeat(lat, len(lon))
-vals = vals * np.cos(np.deg2rad(cell_lat[cols]))
-keep = land.ravel()[cols]
-rows, cols, vals = rows[keep], cols[keep], vals[keep]
-
-#### Catchments that only touch water cells (lake shore) fall back to the nearest land cell
-covered = np.bincount(rows, weights=vals, minlength=len(cat)) > 0
-if (~covered).any():
-    land_idx = np.flatnonzero(land.ravel())
-    land_xy = np.c_[np.tile(lon, len(lat))[land_idx], cell_lat[land_idx]]
-    cxy = cat.geometry.iloc[np.flatnonzero(~covered)].representative_point()
-    near = land_idx[np.argmin((cxy.x.to_numpy()[:, None] - land_xy[:, 0]) ** 2 +
-                              (cxy.y.to_numpy()[:, None] - land_xy[:, 1]) ** 2, axis=1)]
-    rows = np.r_[rows, np.flatnonzero(~covered)]
-    cols = np.r_[cols, near]
-    vals = np.r_[vals, np.ones(len(near))]
-    print(f"  {int((~covered).sum())} catchments had no land cell; using the nearest land cell")
-
-W_cat = sparse.csr_matrix((vals, (rows, cols)), shape=(len(cat), ncell))
-W_cat = sparse.diags(1.0 / np.asarray(W_cat.sum(axis=1)).ravel()) @ W_cat  # rows sum to 1
-
-### Reorder to the network table (flowline-only reaches have no catchment -> empty row, area 0)
-row_of = pd.Series(np.arange(len(cat)), index=cat["comid"].to_numpy())
-net_row = row_of.reindex(net["comid"].to_numpy()).to_numpy()
-has_cat = ~np.isnan(net_row)
-pick = sparse.csr_matrix((np.ones(has_cat.sum()), (np.flatnonzero(has_cat), net_row[has_cat].astype(np.int64))),
-                         shape=(len(net), len(cat)))
-W_net = (pick @ W_cat).tocsr()
-area_net = np.where(has_cat, net["areasqkm"].to_numpy(), 0.0)
-
-### Model catchments: stream order >= min and a catchment polygon
-model = np.flatnonzero(net["in_model"].to_numpy() & has_cat)
-model_comid = net["comid"].to_numpy()[model]
-W_model = W_net[model]
-print(f"Model catchments: {len(model):,} (of {len(net):,} reaches in the network)")
-
-### Basin weights: area-weighted catchment weights accumulated down the network
-#### bsn weight row i = sum over upstream catchments u of area_u * W_u, divided by the upstream area
-#### Each model reach uses the routing Catchments.py chose for it (basin_routing: split or main)
-#### Solved in blocks of grid cells so the dense right-hand side stays small
-AW = (sparse.diags(area_net) @ W_net).tocsc()
-used = np.flatnonzero(np.asarray(AW.sum(axis=0)).ravel() > 0)
-Wb = np.zeros((len(model), ncell), dtype=np.float32)
-routing = net["basin_routing"].to_numpy()[model]
-block = 128
-for name, make_links in ROUTINGS.items():
-    rows_r = np.flatnonzero(routing == name)
-    if not len(rows_r):
-        continue
-    solve = upstream_solver(net["comid"], net["hydroseq"], make_links(net))
-    for b0 in range(0, len(used), block):
-        cols_b = used[b0:b0 + block]
-        Wb[np.ix_(rows_r, cols_b)] = solve(AW[:, cols_b].toarray())[model[rows_r]]
-up_area = Wb.sum(axis=1, dtype=np.float64)
-if np.any(up_area <= 0):
-    raise RuntimeError("Some model catchments have zero upstream area")
-#### Same routing as Catchments.py: each row's area must equal that reach's acc_areasqkm
-mismatch = np.abs(up_area / net["acc_areasqkm"].to_numpy()[model] - 1)
-if mismatch.max() > 1e-3:
-    raise RuntimeError(f"Basin weights disagree with network.parquet acc_areasqkm (max rel. diff {mismatch.max():.4f})")
-Wb = sparse.csr_matrix(Wb / up_area[:, None].astype(np.float32))
-Wb.data[Wb.data < 1e-9] = 0
-Wb.eliminate_zeros()
-print(f"Basin weights: {Wb.nnz:,} nonzeros "
-      f"(median {np.median(np.diff(Wb.indptr)):.0f} cells per basin, max {np.diff(Wb.indptr).max()})")
+model, model_comid, cat_row_model, W_model, Wb = catchment_basin_weights(lat, lon, land, net, cat)
 
 ### Point time series for every grid cell that carries catchment weight (instant_source: timeseries)
 #### One request per cell returns the whole period, all instantaneous variables; each is reduced to local
@@ -421,7 +344,7 @@ if source == "timeseries":
 
 
 ### Latitude / longitude of each model catchment (for Ra and the output table)
-cent = cat.geometry.iloc[net_row[model].astype(np.int64)].to_crs(5070).centroid.to_crs(4326)
+cent = cat.geometry.iloc[cat_row_model].to_crs(5070).centroid.to_crs(4326)
 m_lon, m_lat = cent.x.to_numpy(), cent.y.to_numpy()
 
 
@@ -519,15 +442,8 @@ def year_fields(y):
     return days, f
 
 
-### Extraterrestrial radiation Ra (mm/day), FAO-56; same formula as PET.Rmd
-def ra_mm(doy, lat_deg):
-    phi = np.deg2rad(lat_deg)[None, :]
-    j = doy[:, None]
-    dr = 1 + 0.033 * np.cos(2 * np.pi / 365 * j)
-    dec = 0.409 * np.sin(2 * np.pi / 365 * j - 1.39)
-    ws = np.arccos(np.clip(-np.tan(phi) * np.tan(dec), -1, 1))
-    return 0.408 * (24 * 60 / np.pi) * 0.0820 * dr * (ws * np.sin(phi) * np.sin(dec) + np.cos(phi) * np.cos(dec) * np.sin(ws))
-
+### Ra (extraterrestrial radiation) now comes from pipeline_utils.ra_mm (imported in Section 1),
+#### shared with Meteo_gridmet.py since the formula doesn't depend on the meteorology source.
 
 ## 8. Extract and write one parquet per year
 ### Catchment value = W_model @ field; basin value = Wb @ field (both rows sum to 1)
