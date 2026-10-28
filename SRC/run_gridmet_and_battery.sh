@@ -1,40 +1,31 @@
 #!/usr/bin/env bash
-# run_after_gridmet.sh
+# run_gridmet_and_battery.sh
 #
-# Purpose : queued to run once the GridMET meteo pull finishes -- rebuilds the final model-input
-#           parquet (q_processing, now driven by GridMET instead of ERA5-Land) and then reruns the
-#           Battery I continuation (I05-I08) against it, so the H01-architecture comparison (I05 in
-#           particular -- SO7-9, 3-layer GAT, both DOY, the direct match to the original historical
-#           H01 setup) is retested on the meteorology source that reference actually used.
-#
-#           Run names get a "_gridmet" suffix rather than reusing I05-I08 as-is: those names
-#           already hold the ERA5-based results, and DDNN_Model.py overwrites OUTPUTS_DIR
-#           unconditionally, so reusing them would destroy exactly the ERA5-vs-GridMET comparison
-#           this rerun exists to make.
-# Usage   : bash SRC/run_after_gridmet.sh <meteo_pid>
+# Purpose : the correct single-script version of what run_after_gridmet.sh tried to do by polling
+#           an external PID (which can't observe that process's exit code and silently proceeded
+#           past a real crash -- see git history). Runs meteo -> q_processing -> Battery I
+#           continuation (I05-I08) as one chain under `set -e`, so a real failure in any step stops
+#           everything immediately instead of continuing on stale data.
+# Usage   : bash SRC/run_gridmet_and_battery.sh
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-METEO_PID="${1:-}"
-if [ -n "$METEO_PID" ]; then
-  echo "Waiting for PID $METEO_PID (Meteo_gridmet.py) to finish..."
-  while kill -0 "$METEO_PID" 2>/dev/null; do
-    sleep 10
-  done
-  echo "PID $METEO_PID finished."
-fi
+echo "=============================================="
+echo "Starting: Meteo_gridmet.py (resumes from cached chunks automatically)"
+echo "=============================================="
+source .venv_pipeline/bin/activate
+python3 SRC/Meteo_gridmet.py
 
 echo
 echo "=============================================="
-echo "Starting: q_processing (rebuild model inputs from GridMET drivers)"
+echo "Starting: Q_Processing_python.py"
 echo "=============================================="
-source .venv_pipeline/bin/activate
 python3 SRC/Q_Processing_python.py
 deactivate
 
 echo
-echo "q_processing complete. Final model inputs rebuilt in data/daily_drivers/."
+echo "Meteo + q_processing complete. Final model inputs rebuilt from GridMET in data/daily_drivers/."
 echo "Starting Battery I continuation (I05-I08) on the GridMET-based dataset."
 echo
 
@@ -68,6 +59,6 @@ run --streamorder-min 6 --streamorder-max 9 $COMMON --no-gat --lambda-smooth 0 \
     --run-name I08_gridmet_so6-9_lb30_lstmOnly_bothDOY_noSmooth
 
 echo
-echo "run_after_gridmet.sh complete. Run: python3 SRC/aggregate_results.py"
+echo "run_gridmet_and_battery.sh complete. Run: python3 SRC/aggregate_results.py"
 echo "Compare I05_gridmet/I06_gridmet/I07_gridmet/I08_gridmet against I05/I06/I07/I08 (ERA5-based)"
 echo "and against historical H01 (Q NSE 0.805, T NSE 0.877)."
