@@ -32,6 +32,7 @@ DEFAULT_CONFIG = REPO_ROOT / "config.yaml"
 REQUIRED_KEYS = [
     "aoi_name", "hucs", "start_date", "end_date",
     "streamorder_min", "snap_crs", "snap_max_distance_m", "era5",
+    "met_source", "gridmet",
     "analysis_cut_date", "trainval_streamorder_min", "model_split_date",
 ]
 

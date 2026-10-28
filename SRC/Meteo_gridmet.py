@@ -35,6 +35,7 @@
 ## 1. Imports
 import argparse
 import shutil
+import time
 
 import geopandas as gpd
 import numpy as np
@@ -126,10 +127,26 @@ def tile_bbox(bbox, target_cells, res):
 
 
 MIN_TILE_CELLS = 20  # give up subdividing a stubborn tile below this size
+CONN_RETRIES = 4  # retries for transient connection failures, before assuming the tile itself is bad
+CONN_RETRY_WAIT_S = 20
+
+#### Substrings distinguishing a transient network failure from GridMET legitimately rejecting a
+#### bad request (e.g. mostly-water bbox). Confirmed 2026-10-26: a real multi-minute network outage
+#### ("Cannot connect to host thredds.northwestknowledge.net... Can't assign requested address")
+#### was being treated the same as a water-only tile -- i.e. subdivided down and then silently
+#### written off as "no data" -- which would have created a real gap over land that just happened
+#### to be unreachable at that moment, not an actual absence of data.
+CONN_ERROR_MARKERS = ("cannot connect", "can't assign requested address", "connection reset",
+                      "timed out", "timeout", "temporary failure in name resolution", "server disconnected")
 
 
 def _has_catchments(tb):
     return len(cat_sindex.query(box(*tb), predicate="intersects")) > 0
+
+
+def _is_connection_error(exc):
+    msg = str(exc).lower()
+    return any(marker in msg for marker in CONN_ERROR_MARKERS)
 
 
 def _fetch_leaves(tb, years_list, variables, out):
@@ -145,20 +162,35 @@ def _fetch_leaves(tb, years_list, variables, out):
     #### rather than merged here -- combine_by_coords cannot reliably infer concat order once
     #### tiles are missing in an irregular (non-hypercube) pattern, which an all-water tile
     #### guarantees; fetch_gridmet below assembles the full grid itself instead.
+    #### A connection-level failure is retried several times with a wait, rather than treated as
+    #### evidence the tile is bad -- a network blip doesn't get fixed by subdividing the request,
+    #### and wrongly assuming it does would silently drop real land data as "no data".
     if not _has_catchments(tb):
         return
-    try:
-        out.append(gridmet.get_bygeom(tb, years_list, variables=variables))
-    except Exception as exc:
-        w, s, e, n = tb
-        ncells = ((e - w) / GRIDMET_RES) * ((n - s) / GRIDMET_RES)
-        if ncells <= MIN_TILE_CELLS:
-            print(f"    tile {tb} failed at minimum size ({exc}); treating as no data", flush=True)
+    for attempt in range(1, CONN_RETRIES + 1):
+        try:
+            out.append(gridmet.get_bygeom(tb, years_list, variables=variables))
             return
-        mid_lon, mid_lat = (w + e) / 2, (s + n) / 2
-        for q in [(w, s, mid_lon, mid_lat), (w, mid_lat, mid_lon, n),
-                  (mid_lon, s, e, mid_lat), (mid_lon, mid_lat, e, n)]:
-            _fetch_leaves(q, years_list, variables, out)
+        except Exception as exc:
+            if _is_connection_error(exc) and attempt < CONN_RETRIES:
+                print(f"    tile {tb} connection error (attempt {attempt}/{CONN_RETRIES}): {exc}; "
+                      f"retrying in {CONN_RETRY_WAIT_S}s", flush=True)
+                time.sleep(CONN_RETRY_WAIT_S)
+                continue
+            if _is_connection_error(exc):
+                raise RuntimeError(f"Tile {tb} still failing after {CONN_RETRIES} attempts due to a "
+                                    f"connection error, not a bad request -- not safe to assume it's "
+                                    f"water-only. Check network connectivity and rerun: {exc}") from exc
+            w, s, e, n = tb
+            ncells = ((e - w) / GRIDMET_RES) * ((n - s) / GRIDMET_RES)
+            if ncells <= MIN_TILE_CELLS:
+                print(f"    tile {tb} failed at minimum size ({exc}); treating as no data", flush=True)
+                return
+            mid_lon, mid_lat = (w + e) / 2, (s + n) / 2
+            for q in [(w, s, mid_lon, mid_lat), (w, mid_lat, mid_lon, n),
+                      (mid_lon, s, e, mid_lat), (mid_lon, mid_lat, e, n)]:
+                _fetch_leaves(q, years_list, variables, out)
+            return
 
 
 def fetch_gridmet(bbox, years_list, variables):

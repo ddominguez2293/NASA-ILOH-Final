@@ -35,7 +35,12 @@ from pipeline_utils import (banner, config_fingerprint, get_paths, is_up_to_date
                             require_files, write_stamp)
 
 STEP = "q_processing"
+#### met_source/gridmet are included so switching meteorology sources is detected as a real input
+#### change -- without them, this step's fingerprint wouldn't move when only met_source changed,
+#### and it would keep skipping ("up to date") even after a successful GridMET pull replaced the
+#### driver files Meteo.py/Meteo_gridmet.py wrote.
 CONFIG_KEYS = ["aoi_name", "hucs", "start_date", "end_date", "streamorder_min", "era5",
+               "met_source", "gridmet",
                "analysis_cut_date", "trainval_streamorder_min", "model_split_date"]
 
 ## 2. Config and paths
