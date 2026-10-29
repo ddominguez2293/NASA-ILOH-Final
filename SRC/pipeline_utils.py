@@ -359,10 +359,20 @@ def catchment_basin_weights(lat, lon, land, net, cat):
     res = float(abs(lon[1] - lon[0]))
 
     ### Catchment weights: polygon x cell coverage (exactextract) x cell area (cos lat), land cells only
+    #### ~1,976 of the 354k NHDPlus catchments have self-intersecting rings (invalid geometry). This
+    #### stayed harmless against ERA5-Land's coarser grid but segfaults exactextract's cell-traversal
+    #### C++ code against GridMET's finer grid (KERN_INVALID_ADDRESS in exactextract::Cell::take) --
+    #### make_valid() first fixes the ~0.5% of invalid polygons (verified: area unchanged to 1e-6%).
+    cat_geom = cat.geometry
+    invalid = ~cat_geom.is_valid
+    if invalid.any():
+        cat_geom = cat_geom.copy()
+        cat_geom.loc[invalid] = cat_geom.loc[invalid].make_valid()
     xmin, xmax = float(lon[0] - res / 2), float(lon[-1] + res / 2)
     ymin, ymax = float(lat[-1] - res / 2), float(lat[0] + res / 2)
     grid = NumPyRasterSource(np.ones(land.shape), xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax)
-    cov = exact_extract(grid, cat[["geometry"]].reset_index(drop=True), ["cell_id", "coverage"], output="pandas")
+    cat_fixed = cat[["geometry"]].reset_index(drop=True).assign(geometry=cat_geom.reset_index(drop=True))
+    cov = exact_extract(grid, cat_fixed, ["cell_id", "coverage"], output="pandas")
 
     rows = np.repeat(np.arange(len(cat)), cov["cell_id"].map(len).to_numpy())
     cols = np.concatenate(cov["cell_id"].to_numpy()).astype(np.int64)

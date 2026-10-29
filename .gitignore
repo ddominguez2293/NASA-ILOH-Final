@@ -77,3 +77,6 @@ rsconnect/
 .venv_pipeline/
 __pycache__/
 *.pyc
+
+# GridMET grid-chunk fetch cache (generated)
+/SRC/cache/
