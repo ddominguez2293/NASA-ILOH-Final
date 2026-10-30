@@ -767,7 +767,7 @@ if SAVE_MODEL:
     joblib.dump(FEATURES, FEATURES_PATH)
     print(f"Saved FEATURES to: {FEATURES_PATH}")
 
-keep_cols = ["comid", "date"] + FEATURES + TARGETS + ["temp_avail_raw", "q_avail_raw"]
+keep_cols = ["comid", "date"] + FEATURES + TARGETS + ["temp_avail_raw", "q_avail_raw", "q_avail_measured"]
 nodes_df = nodes_df_raw[keep_cols].copy()
 
 ### Replace -9998 sentinels with NaN
@@ -927,7 +927,10 @@ Y_TN2[t_idx_arr, n_idx_arr, 1] = nodes_df[T_COL].to_numpy(dtype=np.float32)
 
 # masks come from raw availability columns (not scaled)
 Tmask_TN[t_idx_arr, n_idx_arr] = nodes_df["temp_avail_raw"].to_numpy(dtype=bool)
-Qmask_TN[t_idx_arr, n_idx_arr] = nodes_df["q_avail_raw"].to_numpy(dtype=bool)
+### Fix #4: Qmask must come from q_avail_measured (genuine USGS measurements only),
+#### not q_avail_raw, which also marks interpolated/repaired Q values as "available"
+#### and lets the model train/be scored against values it never actually observed.
+Qmask_TN[t_idx_arr, n_idx_arr] = nodes_df["q_avail_measured"].to_numpy(dtype=bool)
 
 ## 8. Train–validation–test datasets
 #### Each sample is a LOOKBACK-day input window across all nodes ending at time t,
