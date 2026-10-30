@@ -865,8 +865,12 @@ if train_mask_rows.sum() == 0:
 
 scaler_X = MinMaxScaler()
 scaler_y = MinMaxScaler()
-fit_X = np.nan_to_num(nodes_df.loc[train_mask_rows, FEATURES].values, nan=0.0)
-fit_y = np.nan_to_num(nodes_df.loc[train_mask_rows, TARGETS].values, nan=0.0)
+### Fix #5: fit/transform with NaN left in place (sklearn's MinMaxScaler uses
+#### nanmin/nanmax natively on fit, and NaN propagates through transform) instead
+#### of pre-filling with np.nan_to_num(nan=0.0), which corrupted both the fitted
+#### min/max range and the scaled values for every row with a missing feature.
+fit_X = nodes_df.loc[train_mask_rows, FEATURES].values
+fit_y = nodes_df.loc[train_mask_rows, TARGETS].values
 
 scaler_X.fit(fit_X)
 scaler_y.fit(fit_y)
@@ -876,11 +880,16 @@ if hasattr(scaler_X, "n_features_in_") and scaler_X.n_features_in_ != len(FEATUR
 
 scaler_feature_diagnostic(scaler_X, FEATURES, max_lines=40)
 
-### Transform all rows using train-fitted scalers
-X_all = np.nan_to_num(nodes_df[FEATURES].values, nan=0.0)
-Y_all = np.nan_to_num(nodes_df[TARGETS].values, nan=0.0)
+### Transform all rows using train-fitted scalers (NaN in -> NaN out)
+X_all = nodes_df[FEATURES].values
+Y_all = nodes_df[TARGETS].values
 nodes_df[FEATURES] = scaler_X.transform(X_all)
 nodes_df[TARGETS]  = scaler_y.transform(Y_all)
+
+### Missing *features* are filled only now, in scaled space, so a missing
+#### value lands at this feature's training-minimum rather than an
+#### arbitrary absolute zero that may not be a realistic value for it.
+nodes_df[FEATURES] = nodes_df[FEATURES].fillna(0.0)
 
 ### Precompute scaled threshold for high-flow Q weighting
 q_idx = TARGETS.index(Q_COL)
