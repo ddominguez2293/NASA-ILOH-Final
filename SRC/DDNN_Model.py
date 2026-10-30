@@ -59,6 +59,11 @@ from torch_geometric.nn import GATConv
 ### Sklearn
 from sklearn.preprocessing import MinMaxScaler
 
+### Fix #10A: delegate to the fixed (BFS) graph_utils implementation instead of
+#### the old buggy DFS/frontier.pop() version below -- isolates #10A's effect
+#### on top of fixes #4+#5, already re-applied.
+from graph_utils import build_coarsened_edges as _fixed_build_coarsened_edges
+
 
 ## 2. Configuration
 
@@ -515,50 +520,13 @@ def build_edge_pairs_from_nodes(edges_df: pd.DataFrame) -> pd.DataFrame:
     return edge_pairs_all
 
 ### Coarsen the network to edges between observed COMIDs
+#### Fix #10A: delegates to the fixed (BFS) graph_utils implementation instead
+#### of the old buggy DFS/frontier.pop() version, which wiped the entire
+#### frontier (across all divergent branches) on the first observed-node hit
+#### from any branch, silently dropping legitimate edges.
 def build_coarsened_edges(edge_pairs_all: pd.DataFrame, observed_comids: set,
                           max_hops=5000, mode="nearest") -> pd.DataFrame:
-    """
-    Collapse the full COMID network down to edges between observed COMIDs only.
-
-    For each observed COMID, walk downstream through the full graph until you hit another
-    observed COMID. Add an edge (src_observed -> downstream_observed).
-      mode="nearest": stop at first encountered observed downstream node.
-    """
-    dn_map = {}
-    for u, v in edge_pairs_all[["comid_up", "comid_dn"]].itertuples(index=False):
-        try:
-            u_i = int(u); v_i = int(v)
-        except Exception:
-            continue
-        dn_map.setdefault(u_i, []).append(v_i)
-
-    coarse_edges = set()
-
-    for src in observed_comids:
-        src = int(src)
-        seen = {src}
-        frontier = [src]
-        hops = 0
-
-        while frontier and hops < max_hops:
-            curr = frontier.pop()
-
-            for dn in dn_map.get(curr, []):
-                if dn in seen:
-                    continue
-                seen.add(dn)
-
-                if dn in observed_comids and dn != src:
-                    coarse_edges.add((src, dn))
-                    if mode == "nearest":
-                        frontier = []
-                        break
-                else:
-                    frontier.append(dn)
-
-            hops += 1
-
-    return pd.DataFrame(list(coarse_edges), columns=["comid_up", "comid_dn"])
+    return _fixed_build_coarsened_edges(edge_pairs_all, observed_comids, max_hops=max_hops, mode=mode)
 
 ### Edge QA checks
 def edge_qa_checks(edge_pairs: pd.DataFrame, all_comids: np.ndarray) -> None:
